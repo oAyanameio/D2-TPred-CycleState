@@ -1,0 +1,16 @@
+name: d2tpred_env
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.8
+  - pip
+  - numpy=1.24.4
+  - scipy=1.10.1
+  - pytorch=2.1.2
+  - torchvision=0.16.2
+  - cudatoolkit=12.1
+  - pip:
+    - tensorboardX==2.6.2.2
+    - protobuf==5.29.6
