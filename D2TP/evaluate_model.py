@@ -1,3 +1,9 @@
+"""模型评估脚本。
+
+核心思路是对同一段观测轨迹采样多次预测结果，
+再按场景挑出 ADE 最小的那条，统计最终指标。
+"""
+
 import argparse
 import os
 
@@ -78,6 +84,12 @@ parser.add_argument(
 
 
 def evaluate_helper(error, seq_start_end):
+    """按场景聚合多次采样误差，并选出最优样本。
+
+    `error` 里存的是多次采样得到的 raw ADE/FDE。
+    对于同一个场景中的多个目标，先把目标误差相加，
+    然后从多次采样结果里取最小值，等价于 best-of-K 评估。
+    """
     sum_ = 0
     error = torch.stack(error, dim=1)
     for (start, end) in seq_start_end:
@@ -91,6 +103,7 @@ def evaluate_helper(error, seq_start_end):
 
 
 def get_generator(checkpoint):
+    """根据 checkpoint 重建生成器并加载权重。"""
     n_units = (
         [args.traj_lstm_hidden_size]
         + [int(x) for x in args.hidden_units.strip().split(",")]
@@ -118,12 +131,14 @@ def get_generator(checkpoint):
 
 
 def cal_ade_fde(pred_traj_gt, pred_traj_fake):
+    """同时计算一批预测的 ADE 与 FDE。"""
     ade = displacement_error(pred_traj_fake, pred_traj_gt, mode="raw")
     fde = final_displacement_error(pred_traj_fake[-1], pred_traj_gt[-1], mode="raw")
     return ade, fde
 
 
 def evaluate(args, loader, generator):
+    """在整个数据集上做 best-of-K 评估。"""
     ade_outer, fde_outer = [], []
     total_traj = 0
     with torch.no_grad():
@@ -146,11 +161,13 @@ def evaluate(args, loader, generator):
             total_traj += pred_traj_gt.size(1)
 
             for _ in range(args.num_samples):
+                # 每次前向都会重新采样噪声，因此能得到不同的未来轨迹假设。
                 pred_traj_fake_rel = generator(
                     obs_traj_rel, obs_traj,obs_state,pred_state,seq_start_end, 0, 3
                 )
                 pred_traj_fake_rel = pred_traj_fake_rel[-args.pred_len :]
 
+                # 评估指标都在绝对坐标上计算，所以需要先还原坐标。
                 pred_traj_fake = relative_to_abs(pred_traj_fake_rel, obs_traj[-1,:,2:4])
                 ade_, fde_ = cal_ade_fde(pred_traj_gt[:,:,2:4], pred_traj_fake)
                 ade.append(ade_)
@@ -167,6 +184,7 @@ def evaluate(args, loader, generator):
 
 
 def main(args):
+    """评估脚本入口。"""
     checkpoint = torch.load(args.resume)
     generator = get_generator(checkpoint)
     path = get_dset_path(args.dataset_name, args.dset_type)

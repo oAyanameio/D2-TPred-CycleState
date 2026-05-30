@@ -1,3 +1,11 @@
+"""模型训练脚本。
+
+这里实现了一个生成器 + 判别器的训练流程：
+1. 生成器预测未来轨迹。
+2. 判别器区分真实轨迹和生成轨迹。
+3. 训练时同时使用重建损失和 GAN 对抗损失。
+"""
+
 import argparse
 import logging
 import os
@@ -107,12 +115,15 @@ best_ade = 100
 
 
 def main(args):
+    """训练入口，负责准备数据、模型、优化器并驱动训练循环。"""
+    # 固定随机种子，尽量让实验可复现。
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+    # 这里会覆盖前面脚本顶部的环境变量设置。
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     train_path = get_dset_path(args.dataset_name, "train")
     val_path = get_dset_path(args.dataset_name, "test")
@@ -124,12 +135,14 @@ def main(args):
 
     writer = SummaryWriter()
 
+    # 图网络每层的通道数配置，例如 `[32, 16, 32]`。
     n_units = (
         [args.traj_lstm_hidden_size]
         + [int(x) for x in args.hidden_units.strip().split(",")]
         + [args.graph_lstm_hidden_size]
     )
 
+    # 每层图注意力头数，例如 `4,1`。
     n_heads = [int(x) for x in args.heads.strip().split(",")]
 
     model = TrajectoryGenerator(
@@ -147,6 +160,7 @@ def main(args):
         noise_type=args.noise_type,
     )
     model.cuda()
+    # 判别器只在 GAN 训练时使用，用来区分真轨迹和假轨迹。
     Discriminator=TrajectoryDiscriminator(
         obs_len=args.obs_len,
         pred_len=args.pred_len,
@@ -161,11 +175,13 @@ def main(args):
     )
     Discriminator.cuda()
 
+    # 原仓库使用 RMSprop 优化器。
     optimizer = optim.RMSprop(model.parameters(), lr=1e-3)
     optimizer_d = optim.RMSprop(Discriminator.parameters(), lr=1e-3)
     global best_ade
     if args.resume:
         if os.path.isfile(args.resume):
+            # 断点恢复时只恢复生成器权重；判别器和优化器维持当前实现逻辑。
             logging.info("Restoring from checkpoint {}".format(args.resume))
             checkpoint = torch.load(args.resume)
             args.start_epoch = checkpoint["epoch"]
@@ -178,11 +194,14 @@ def main(args):
         else:
             logging.info("=> no checkpoint found at '{}'".format(args.resume))
 
+    # 当前实现里 `training_step` 未继续参与控制逻辑，但保留了函数签名兼容性。
     training_step = 3
     D_step=2
     for epoch in range(args.start_epoch, args.num_epochs + 1):
+        # 主动触发垃圾回收，减少长时间训练中的显存/内存碎片问题。
         gc.collect() 
         for batch_idx, batch in enumerate(train_loader):
+            # 这里采用“判别器多走几步、生成器再走一步”的交替训练方式。
             if D_step>0:
                 D_train(args,len(train_loader), model,batch_idx,batch,Discriminator, optimizer_d, epoch, training_step, writer)
                 D_step=D_step-1
@@ -208,6 +227,12 @@ def main(args):
 
 
 def train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, training_step, writer):
+    """训练生成器。
+
+    生成器的目标包括两部分：
+    - 轨迹重建损失：让预测结果尽量接近真实未来。
+    - 对抗损失：让判别器更难分辨真假。
+    """
     losses = utils.AverageMeter("L2_Loss", ":.6f")
     g_losses = utils.AverageMeter("G_Loss", ":.6f")
     progress = utils.ProgressMeter(
@@ -228,14 +253,17 @@ def train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, trai
     ) = batch
 
     optimizer.zero_grad()
+    # 真实未来轨迹只取 x/y 两个位置通道。
     predtrajgt = pred_traj_gt[:, :, 2:4]
     L2_loss = torch.zeros(1).to(predtrajgt)
-    loss = torch.zeros(1).to(predtrajgt)
     l2_loss_rel = []
+    # 观测阶段不参与未来预测损失，因此把 mask 截到预测段。
     loss_mask = loss_mask[:, args.obs_len :]
 
+    # 训练时把观测段和真实预测段拼起来，供 teacher forcing 使用。
     model_input = torch.cat((obs_traj_rel, pred_traj_gt_rel), dim=0)
     for _ in range(args.best_k):
+        # 由于生成器内部会加噪声，因此多次前向可以采样多种未来。
         pred_traj_fake_rel = model(model_input, obs_traj, obs_state, pred_state, seq_start_end, 0)  # ？
         modinput = model_input[:, :, 2:4]
         l2_loss_rel.append(
@@ -247,6 +275,7 @@ def train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, trai
             )
         )
 
+    # 把相对预测轨迹还原为绝对坐标，再接回观测轨迹，形成完整轨迹序列。
     pred_traj_fake = torch.cat((obs_traj[:,:,2:4],relative_to_abs(pred_traj_fake_rel, obs_traj[-1,:,2:4])),dim=0)
     traj_state=torch.cat((obs_state,pred_state),dim=0)
     fakesocre=Discriminator(pred_traj_fake,traj_state,seq_start_end)
@@ -255,6 +284,7 @@ def train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, trai
     l2_loss_rel = torch.stack(l2_loss_rel, dim=1)
 
     for start, end in seq_start_end.data:
+        # 对一个场景中的多个目标先求和，再从 K 次采样里选最优结果。
         _l2_loss_rel = torch.narrow(l2_loss_rel, 0, start, end - start)
         _l2_loss_rel = torch.sum(_l2_loss_rel, dim=0)
         _l2_loss_rel = torch.min(_l2_loss_rel) / (
@@ -263,9 +293,9 @@ def train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, trai
         l2_loss_sum_rel += _l2_loss_rel
 
     L2_loss += l2_loss_sum_rel
-    loss+=1*g_loss
     losses.update(L2_loss.item(), obs_traj.shape[1])
     g_losses.update(g_loss.item(),obs_traj.shape[1])
+    # 原仓库把对抗损失放大 1000 倍后再与 L2 损失相加。
     total_loss=L2_loss+g_loss*1000
     total_loss.backward()
     optimizer.step()
@@ -275,6 +305,7 @@ def train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, trai
     writer.add_scalar("g_ad_loss", g_losses.avg*1000, batch_idx)
 
 def D_train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, training_step, writer):
+    """训练判别器，让它区分真实轨迹和生成轨迹。"""
     D_losses = utils.AverageMeter("D_Loss", ":.6f")
     progress = utils.ProgressMeter(
         lens,[D_losses], prefix="Epoch: [{}]".format(epoch)
@@ -294,9 +325,11 @@ def D_train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, tr
     ) = batch
     optimizer.zero_grad()
 
+    # 判别器训练时也复用生成器输出，但这里只把它当作“假样本来源”。
     model_input = torch.cat((obs_traj_rel, pred_traj_gt_rel), dim=0)
     pred_traj_fake_rel = model(model_input, obs_traj, obs_state, pred_state, seq_start_end, 0)  # ？
 
+    # 假轨迹由“观测段 + 生成未来”组成，真轨迹由“观测段 + 真实未来”组成。
     pred_traj_fake = torch.cat((obs_traj[:,:,2:4],relative_to_abs(pred_traj_fake_rel, obs_traj[-1,:,2:4])),dim=0)
     traj_state=torch.cat((obs_state,pred_state),dim=0)
     traj_real=torch.cat((obs_traj[:,:,2:4],pred_traj_gt[:,:,2:4]),dim=0)
@@ -313,9 +346,9 @@ def D_train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, tr
     writer.add_scalar("d_train_loss", D_losses.avg, epoch)
 
 def validate(args, model, val_loader, epoch, writer):
+    """在验证集上评估生成器的 ADE/FDE。"""
     ade = utils.AverageMeter("ADE", ":.6f")
     fde = utils.AverageMeter("FDE", ":.6f")
-    # progress = utils.ProgressMeter(len(val_loader), [ade, fde], prefix="Test: ")
 
     model.eval()
     with torch.no_grad():
@@ -333,6 +366,7 @@ def validate(args, model, val_loader, epoch, writer):
                 seq_start_end,
             ) = batch
 
+            # 验证阶段只把观测轨迹送进去，模型需要完全靠自回归预测未来。
             pred_traj_fake_rel= model(obs_traj_rel, obs_traj,obs_state,pred_state, seq_start_end)
 
             pred_traj_fake_rel_predpart = pred_traj_fake_rel[-args.pred_len :]
@@ -340,6 +374,7 @@ def validate(args, model, val_loader, epoch, writer):
             pred_traj_fake = relative_to_abs(pred_traj_fake_rel_predpart, obs_traj[-1])
             pred_traj_gt = pred_traj_gt[:, :, 2:4]
             ade_, fde_ = cal_ade_fde(pred_traj_gt, pred_traj_fake)
+            # 按“每条轨迹、每个时间步”做平均，得到标准 ADE/FDE。
             ade_ = ade_ / (obs_traj.shape[1] * args.pred_len)
 
             fde_ = fde_ / (obs_traj.shape[1])
@@ -355,12 +390,14 @@ def validate(args, model, val_loader, epoch, writer):
 
 
 def cal_ade_fde(pred_traj_gt, pred_traj_fake):
+    """同时返回 ADE 和 FDE 的总和形式。"""
     ade = displacement_error(pred_traj_fake, pred_traj_gt)
     fde = final_displacement_error(pred_traj_fake[-1], pred_traj_gt[-1])
     return ade, fde
 
 
 def save_checkpoint(state, is_best, filename="checkpoint.pth.tar"):
+    """保存 checkpoint，并在性能更好时同步更新最佳模型。"""
     if is_best:
         torch.save(state, filename)
         logging.info("-------------- lower ade ----------------")

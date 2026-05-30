@@ -1,3 +1,9 @@
+"""轨迹可视化脚本。
+
+这个脚本会对每个 batch 采样多次预测轨迹，
+然后选出误差最小的一组结果画图保存。
+"""
+
 import argparse
 import os
 
@@ -82,6 +88,7 @@ parser.add_argument(
 
 
 def evaluate_helper(error, seq_start_end, model_output_traj, model_output_traj_best):
+    """从多次采样中为每个场景挑出误差最小的预测轨迹。"""
     error = torch.stack(error, dim=1)
     for (start, end) in seq_start_end:
         start = start.item()
@@ -96,6 +103,7 @@ def evaluate_helper(error, seq_start_end, model_output_traj, model_output_traj_b
 
 
 def get_generator(checkpoint):
+    """重建生成器并加载训练好的参数。"""
     n_units = (
         [args.traj_lstm_hidden_size]
         + [int(x) for x in args.hidden_units.strip().split(",")]
@@ -123,12 +131,20 @@ def get_generator(checkpoint):
 
 
 def cal_ade_fde(pred_traj_gt, pred_traj_fake):
+    """计算单次采样结果的 ADE/FDE，用于从多次采样中选最好的一条。"""
     ade = displacement_error(pred_traj_fake, pred_traj_gt, mode="raw")
     fde = final_displacement_error(pred_traj_fake[-1], pred_traj_gt[-1], mode="raw")
     return ade, fde
 
 
 def plot_trajectory(args, loader, generator):
+    """生成并保存轨迹对比图。
+
+    图中包含三部分：
+    - 红线：观测轨迹。
+    - 蓝线：真实未来轨迹。
+    - 黄虚线：模型预测的未来轨迹。
+    """
     ground_truth_input = []
     all_model_output_traj = []
     ground_truth_output = []
@@ -152,6 +168,7 @@ def plot_trajectory(args, loader, generator):
             model_output_traj_best = torch.ones_like(pred_traj_gt).cuda()
 
             for _ in range(args.num_samples):
+                # 多次采样，后面再根据误差挑最优结果做展示。
                 pred_traj_fake_rel = generator(
                     obs_traj_rel, obs_traj, seq_start_end, 0, 3
                 )
@@ -168,6 +185,7 @@ def plot_trajectory(args, loader, generator):
 
             for (start, end) in seq_start_end:
                 plt.figure(figsize=(20,15), dpi=100)
+                # 下面这些张量都转成 numpy，方便 matplotlib 逐条轨迹绘制。
                 ground_truth_input_x_piccoor = (
                     obs_traj[:, start:end, :].cpu().numpy()[:, :, 0].T
                 )
@@ -187,7 +205,7 @@ def plot_trajectory(args, loader, generator):
                     model_output_traj_best[:, start:end, :].cpu().numpy()[:, :, 1].T
                 )
                 for i in range(ground_truth_output_x_piccoor.shape[0]):
-
+                    # 历史轨迹用红线显示，并在最后两个点间画箭头指示运动方向。
                     observed_line = plt.plot(
                         ground_truth_input_x_piccoor[i, :],
                         ground_truth_input_y_piccoor[i, :],
@@ -210,6 +228,7 @@ def plot_trajectory(args, loader, generator):
                         ),
                         size=20,
                     )
+                    # 真实未来轨迹从历史最后一点开始继续接上。
                     ground_line = plt.plot(
                         np.append(
                             ground_truth_input_x_piccoor[i, -1],
@@ -223,6 +242,7 @@ def plot_trajectory(args, loader, generator):
                         linewidth=4,
                         label="Ground Truth",
                     )[0]
+                    # 预测轨迹同样从历史最后一点出发，便于与真实轨迹直观看差异。
                     predict_line = plt.plot(
                         np.append(
                             ground_truth_input_x_piccoor[i, -1],
@@ -238,7 +258,7 @@ def plot_trajectory(args, loader, generator):
                         label="Predicted Trajectory",
                     )[0]
 
-                #plt.axis("off")
+                # 原仓库保留了坐标轴，便于观察空间位置关系。
                 plt.savefig(
                     "./traj_fig/pic_{}.png".format(pic_cnt)
                 )
@@ -247,6 +267,7 @@ def plot_trajectory(args, loader, generator):
 
 
 def main(args):
+    """可视化脚本入口。"""
     checkpoint = torch.load(args.resume)
     generator = get_generator(checkpoint)
     path = get_dset_path(args.dataset_name, args.dset_type)
