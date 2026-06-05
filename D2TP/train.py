@@ -17,7 +17,11 @@ import gc
 from tensorboardX import SummaryWriter
 import utils
 from data.loader import data_loader
-from models import TrajectoryGenerator,TrajectoryDiscriminator
+from models import (
+    TrajectoryGenerator,
+    TrajectoryDiscriminator,
+    CycleStateTrajectoryGenerator,
+)
 from utils import (
     displacement_error,
     final_displacement_error,
@@ -69,6 +73,12 @@ parser.add_argument(
     help="dims of every node after through GAT module",
 )
 parser.add_argument("--graph_lstm_hidden_size", default=32, type=int)
+parser.add_argument(
+    "--model_type",
+    default="d2tpred",
+    choices=["d2tpred", "cyclestate"],
+    help="选择训练的生成器类型。",
+)
 
 parser.add_argument(
     "--dropout", type=float, default=0, help="Dropout rate (1 - keep probability)."
@@ -96,9 +106,55 @@ parser.add_argument(
 
 parser.add_argument("--best_k", default=20, type=int)
 parser.add_argument("--print_every", default=10, type=int)
+parser.add_argument(
+    "--max_train_batches",
+    default=0,
+    type=int,
+    help="仅用于快速实验。大于 0 时，每个 epoch 最多训练这么多 batch。",
+)
+parser.add_argument(
+    "--max_val_batches",
+    default=0,
+    type=int,
+    help="仅用于快速实验。大于 0 时，验证时最多评估这么多 batch。",
+)
+parser.add_argument(
+    "--generator_only",
+    action="store_true",
+    help="只训练生成器，不更新判别器，用于新模型早期稳定训练。",
+)
+parser.add_argument(
+    "--gan_weight",
+    default=1000.0,
+    type=float,
+    help="生成器对抗损失的缩放系数。",
+)
+parser.add_argument(
+    "--aux_queue_weight",
+    default=0.0,
+    type=float,
+    help="CycleState 的 queue-state 辅助损失权重。",
+)
+parser.add_argument(
+    "--aux_cycle_weight",
+    default=0.0,
+    type=float,
+    help="CycleState 的 cycle-state 辅助损失权重。",
+)
 parser.add_argument("--use_gpu", default=1, type=int)
 parser.add_argument("--gpu_num", default="2", type=str)
 CUDA_VISIBLE_DEVICES = '2'
+parser.add_argument(
+    "--device",
+    default="cuda",
+    choices=["cuda", "cpu"],
+    help="训练设备。选择 cuda 时会在可用 GPU 上运行。",
+)
+parser.add_argument(
+    "--pin_memory",
+    action="store_true",
+    help="DataLoader 是否启用 pin_memory。GPU 训练时建议打开。",
+)
 parser.add_argument(
     "--resume",
     default="",
@@ -111,6 +167,21 @@ parser.add_argument(
 best_ade = 100
 
 
+def maybe_load_compatible_weights(model, state_dict):
+    """尽量复用旧 checkpoint 中与当前模型形状兼容的参数。"""
+    model_state = model.state_dict()
+    compatible_state = {}
+    skipped = []
+    for key, value in state_dict.items():
+        if key in model_state and model_state[key].shape == value.shape:
+            compatible_state[key] = value
+        else:
+            skipped.append(key)
+    model_state.update(compatible_state)
+    model.load_state_dict(model_state)
+    return skipped
+
+
 def main(args):
     """训练入口。"""
     random.seed(args.seed)
@@ -119,7 +190,6 @@ def main(args):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     train_path = get_dset_path(args.dataset_name, "train")
     val_path = get_dset_path(args.dataset_name, "test")
 
@@ -138,7 +208,12 @@ def main(args):
 
     n_heads = [int(x) for x in args.heads.strip().split(",")]
 
-    model = TrajectoryGenerator(
+    model_cls = (
+        CycleStateTrajectoryGenerator
+        if args.model_type == "cyclestate"
+        else TrajectoryGenerator
+    )
+    model = model_cls(
         obs_len=args.obs_len,
         pred_len=args.pred_len,
         traj_lstm_input_size=args.traj_lstm_input_size,
@@ -152,7 +227,7 @@ def main(args):
         noise_dim=args.noise_dim,
         noise_type=args.noise_type,
     )
-    model.cuda()
+    model.to(args.device)
     # 判别器用于判断生成轨迹是否像真实数据。
     Discriminator=TrajectoryDiscriminator(
         obs_len=args.obs_len,
@@ -166,7 +241,7 @@ def main(args):
         embedding_size=32,
         light_embedding_size=16,
     )
-    Discriminator.cuda()
+    Discriminator.to(args.device)
 
     optimizer = optim.RMSprop(model.parameters(), lr=1e-3)
     optimizer_d = optim.RMSprop(Discriminator.parameters(), lr=1e-3)
@@ -174,9 +249,19 @@ def main(args):
     if args.resume:
         if os.path.isfile(args.resume):
             logging.info("Restoring from checkpoint {}".format(args.resume))
-            checkpoint = torch.load(args.resume)
-            args.start_epoch = checkpoint["epoch"]
-            model.load_state_dict(checkpoint["state_dict"])
+            checkpoint = torch.load(args.resume, map_location=args.device)
+            if args.model_type == "cyclestate":
+                skipped_keys = maybe_load_compatible_weights(
+                    model, checkpoint["state_dict"]
+                )
+                logging.info(
+                    "=> warm-started CycleState from checkpoint, skipped {} keys and kept start_epoch={}".format(
+                        len(skipped_keys), args.start_epoch
+                    )
+                )
+            else:
+                args.start_epoch = checkpoint["epoch"]
+                model.load_state_dict(checkpoint["state_dict"])
             logging.info(
                 "=> loaded checkpoint '{}' (epoch {})".format(
                     args.resume, checkpoint["epoch"]
@@ -191,6 +276,40 @@ def main(args):
     for epoch in range(args.start_epoch, args.num_epochs + 1):
         gc.collect() 
         for batch_idx, batch in enumerate(train_loader):
+            if args.max_train_batches > 0 and batch_idx >= args.max_train_batches:
+                logging.info(
+                    "Reached max_train_batches=%d, stop current epoch early.",
+                    args.max_train_batches,
+                )
+                break
+            if args.generator_only:
+                train(
+                    args,
+                    len(train_loader),
+                    model,
+                    batch_idx,
+                    batch,
+                    Discriminator,
+                    optimizer,
+                    epoch,
+                    training_step,
+                    writer,
+                )
+                if batch_idx % args.print_every == 0:
+                    ade = validate(args, model, val_loader, epoch, writer)
+                    is_best = ade < best_ade
+                    best_ade = min(ade, best_ade)
+                    save_checkpoint(
+                        {
+                            "epoch": epoch + 1,
+                            "state_dict": model.state_dict(),
+                            "best_ade": best_ade,
+                            "optimizer": optimizer.state_dict(),
+                        },
+                        is_best,
+                        f"./checkpoint/checkpoint{epoch}.pth.tar",
+                    )
+                continue
             if D_step>0:
                 D_train(args,len(train_loader), model,batch_idx,batch,Discriminator, optimizer_d, epoch, training_step, writer)
                 D_step=D_step-1
@@ -219,11 +338,13 @@ def train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, trai
     """更新生成器。"""
     losses = utils.AverageMeter("L2_Loss", ":.6f")
     g_losses = utils.AverageMeter("G_Loss", ":.6f")
+    aux_queue_losses = utils.AverageMeter("QAux", ":.6f")
+    aux_cycle_losses = utils.AverageMeter("CAux", ":.6f")
     progress = utils.ProgressMeter(
-        lens, [losses]+[g_losses], prefix="Epoch: [{}]".format(epoch)
+        lens, [losses, g_losses, aux_queue_losses, aux_cycle_losses], prefix="Epoch: [{}]".format(epoch)
     )
     model.train()
-    batch = [tensor.cuda() for tensor in batch]
+    batch = [tensor.to(args.device) for tensor in batch]
     (
         obs_traj,
         pred_traj_gt,
@@ -239,7 +360,6 @@ def train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, trai
     optimizer.zero_grad()
     predtrajgt = pred_traj_gt[:, :, 2:4]
     L2_loss = torch.zeros(1).to(predtrajgt)
-    loss = torch.zeros(1).to(predtrajgt)
     l2_loss_rel = []
     loss_mask = loss_mask[:, args.obs_len :]
 
@@ -259,8 +379,11 @@ def train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, trai
 
     pred_traj_fake = torch.cat((obs_traj[:,:,2:4],relative_to_abs(pred_traj_fake_rel, obs_traj[-1,:,2:4])),dim=0)
     traj_state=torch.cat((obs_state,pred_state),dim=0)
-    fakesocre=Discriminator(pred_traj_fake,traj_state,seq_start_end)
-    g_loss=gan_g_loss(fakesocre)
+    if args.generator_only:
+        g_loss = torch.zeros(1).to(predtrajgt)
+    else:
+        fakesocre=Discriminator(pred_traj_fake,traj_state,seq_start_end)
+        g_loss=gan_g_loss(fakesocre)
     l2_loss_sum_rel = torch.zeros(1).to(pred_traj_gt)
     l2_loss_rel = torch.stack(l2_loss_rel, dim=1)
 
@@ -273,16 +396,36 @@ def train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, trai
         l2_loss_sum_rel += _l2_loss_rel
 
     L2_loss += l2_loss_sum_rel
-    loss+=1*g_loss
+    aux_queue_loss = torch.zeros(1).to(predtrajgt)
+    aux_cycle_loss = torch.zeros(1).to(predtrajgt)
+    if args.model_type == "cyclestate" and hasattr(model, "debug_last_aux"):
+        aux_info = model.debug_last_aux
+        if args.aux_queue_weight > 0 and aux_info["queue_pred_last"] is not None:
+            queue_head = aux_info["queue_pred_last"]
+            queue_target = aux_info["queue_targets"][-1]
+            aux_queue_loss = torch.mean((queue_head - queue_target) ** 2)
+        if args.aux_cycle_weight > 0 and aux_info["cycle_pred_last"] is not None:
+            cycle_head = aux_info["cycle_pred_last"]
+            cycle_target = aux_info["cycle_feature_seq"][-1][:, :4]
+            aux_cycle_loss = torch.mean((cycle_head - cycle_target) ** 2)
     losses.update(L2_loss.item(), obs_traj.shape[1])
     g_losses.update(g_loss.item(),obs_traj.shape[1])
-    total_loss=L2_loss+g_loss*1000
+    aux_queue_losses.update(aux_queue_loss.item(), obs_traj.shape[1])
+    aux_cycle_losses.update(aux_cycle_loss.item(), obs_traj.shape[1])
+    total_loss = (
+        L2_loss
+        + g_loss * args.gan_weight
+        + aux_queue_loss * args.aux_queue_weight
+        + aux_cycle_loss * args.aux_cycle_weight
+    )
     total_loss.backward()
     optimizer.step()
     if batch_idx % args.print_every == 0:
         progress.display(batch_idx)
     writer.add_scalar("g_l2_loss", losses.avg, batch_idx)
-    writer.add_scalar("g_ad_loss", g_losses.avg*1000, batch_idx)
+    writer.add_scalar("g_ad_loss", g_losses.avg * args.gan_weight, batch_idx)
+    writer.add_scalar("g_queue_aux_loss", aux_queue_losses.avg, batch_idx)
+    writer.add_scalar("g_cycle_aux_loss", aux_cycle_losses.avg, batch_idx)
 
 def D_train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, training_step, writer):
     """更新判别器。"""
@@ -291,7 +434,7 @@ def D_train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, tr
         lens,[D_losses], prefix="Epoch: [{}]".format(epoch)
     )
     model.train()
-    batch = [tensor.cuda() for tensor in batch]
+    batch = [tensor.to(args.device) for tensor in batch]
     (
         obs_traj,
         pred_traj_gt,
@@ -331,7 +474,13 @@ def validate(args, model, val_loader, epoch, writer):
     model.eval()
     with torch.no_grad():
         for i, batch in enumerate(val_loader):
-            batch = [tensor.cuda() for tensor in batch]
+            if args.max_val_batches > 0 and i >= args.max_val_batches:
+                logging.info(
+                    "Reached max_val_batches=%d, stop validation early.",
+                    args.max_val_batches,
+                )
+                break
+            batch = [tensor.to(args.device) for tensor in batch]
             (
                 obs_traj,
                 pred_traj_gt,
@@ -380,6 +529,10 @@ def save_checkpoint(state, is_best, filename="checkpoint.pth.tar"):
 
 if __name__ == "__main__":
     args = parser.parse_args()
+    if args.device == "cuda" and not torch.cuda.is_available():
+        args.device = "cpu"
+    if args.device == "cpu":
+        args.pin_memory = False
     utils.set_logger(os.path.join(args.log_dir, "train.log"))
     checkpoint_dir = "./checkpoint"
     if os.path.exists(checkpoint_dir) is False:

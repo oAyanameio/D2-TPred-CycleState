@@ -4,7 +4,7 @@ import argparse
 import torch
 
 from data.loader import data_loader
-from models import TrajectoryGenerator
+from models import TrajectoryGenerator, CycleStateTrajectoryGenerator
 from utils import (
     displacement_error,
     final_displacement_error,
@@ -51,6 +51,12 @@ parser.add_argument(
     help="dims of every node after through GAT module",
 )
 parser.add_argument("--graph_lstm_hidden_size", default=32, type=int)
+parser.add_argument(
+    "--model_type",
+    default="d2tpred",
+    choices=["d2tpred", "cyclestate"],
+    help="选择评估的生成器类型。",
+)
 
 
 parser.add_argument("--num_samples", default=20, type=int)
@@ -108,7 +114,12 @@ def get_generator(checkpoint):
         + [args.graph_lstm_hidden_size]
     )
     n_heads = [int(x) for x in args.heads.strip().split(",")]
-    model = TrajectoryGenerator(
+    model_cls = (
+        CycleStateTrajectoryGenerator
+        if args.model_type == "cyclestate"
+        else TrajectoryGenerator
+    )
+    model = model_cls(
         obs_len=args.obs_len,
         pred_len=args.pred_len,
         traj_lstm_input_size=args.traj_lstm_input_size,
