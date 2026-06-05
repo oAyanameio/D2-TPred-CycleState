@@ -20,7 +20,7 @@ import numpy as np
 import time
 from scipy.spatial.distance import pdist, squareform
 
-def get_noise(shape, noise_type):
+def get_noise(shape, noise_type, device):
     """生成噪声，用于提升未来轨迹采样的多样性。
 
     Args:
@@ -29,15 +29,39 @@ def get_noise(shape, noise_type):
             的 agent 数。这样做的含义是：同一个场景内的所有车辆共享同一份
             场景级随机扰动，从而让多模态差异更多体现在“整段交互未来”上。
         noise_type: 噪声分布类型，支持 `"gaussian"` 和 `"uniform"`。
+        device: 噪声张量所在设备。
 
     Returns:
-        位于 GPU 上的随机噪声张量。
+        位于指定设备上的随机噪声张量。
     """
     if noise_type == "gaussian":
-        return torch.randn(*shape).cuda()
+        return torch.randn(*shape, device=device)
     elif noise_type == "uniform":
-        return torch.rand(*shape).sub_(0.5).mul_(2.0).cuda()
+        return torch.rand(*shape, device=device).sub_(0.5).mul_(2.0)
     raise ValueError('Unrecognized noise type "%s"' % noise_type)
+
+
+def get_module_device(module):
+    """获取模块当前所在设备。"""
+    return next(module.parameters()).device
+
+
+class SafeInstanceNorm1d(nn.Module):
+    """兼容短序列输入的 InstanceNorm1d。
+
+    PyTorch 新版本在 `InstanceNorm1d` 的空间维长度为 1 时会直接报错，而本项目的
+    `seqGAT` 在局部时间窗长度为 1 的阶段是合法且常见的。这里在退化到单元素窗口时
+    直接跳过归一化，保留原始特征。
+    """
+
+    def __init__(self, num_features):
+        super(SafeInstanceNorm1d, self).__init__()
+        self.norm = nn.InstanceNorm1d(num_features)
+
+    def forward(self, x):
+        if x.dim() == 3 and x.size(-1) <= 1:
+            return x
+        return self.norm(x)
 
 
 class BatchMultiHeadGraphAttention(nn.Module):
@@ -96,7 +120,8 @@ class BatchMultiHeadGraphAttention(nn.Module):
         )
         attn = self.leaky_relu(attn)
         # 关系矩阵把无关节点对直接置零，只保留可交互边。
-        attn = torch.mul(Relation.unsqueeze(1).repeat(1, self.n_head, 1, 1).cuda(), attn)
+        relation = Relation.to(h.device)
+        attn = torch.mul(relation.unsqueeze(1).repeat(1, self.n_head, 1, 1), attn)
         attn = self.softmax(attn)
 
         attn = self.dropout(attn)
@@ -208,10 +233,9 @@ class GAT(nn.Module):
                 BatchMultiHeadGraphAttention(
                     n_heads[i], f_in=f_in, f_out=n_units[i + 1], attn_dropout=dropout))
 
-        self.norm_list = [
-            torch.nn.InstanceNorm1d(32).cuda(),
-            torch.nn.InstanceNorm1d(64).cuda(),
-        ]
+        self.norm_list = nn.ModuleList(
+            [SafeInstanceNorm1d(32), SafeInstanceNorm1d(64)]
+        )
 
     def forward(self, x, Relation):
         """逐层堆叠图注意力，输出最终的空间交互表征。
@@ -257,10 +281,9 @@ class seqGAT(nn.Module):
                 seqBatchMultiHeadGraphAttention(
                     n_heads[i], f_in=f_in, f_out=n_units[i + 1], attn_dropout=dropout))
 
-        self.norm_list = [
-            torch.nn.InstanceNorm1d(32).cuda(),
-            torch.nn.InstanceNorm1d(64).cuda(),
-        ]
+        self.norm_list = nn.ModuleList(
+            [SafeInstanceNorm1d(32), SafeInstanceNorm1d(64)]
+        )
 
     def forward(self, x):
         """对时间窗口内的图特征进一步聚合。
@@ -344,7 +367,7 @@ class GATEncoder(nn.Module):
         l = 156
 
 
-        currdata = currdata.cuda().data.cpu().numpy()
+        currdata = currdata.detach().cpu().numpy()
         for cur_f in range(F):
             d[cur_f] = squareform(pdist(currdata[cur_f], metric='euclidean'))
         d = np.where(d<=l,1,0)
@@ -371,7 +394,7 @@ class GATEncoder(nn.Module):
                                 r[cur_f, cur_n, n_neig] = 1
                         else:
                             r[cur_f, cur_n, n_neig] = 1
-        r = torch.FloatTensor(r)
+        r = torch.tensor(r, dtype=torch.float32, device=curr_dire.device)
         return r
 
 
@@ -521,9 +544,10 @@ class TrajectoryGenerator(nn.Module):
         Returns:
             `(h_0, c_0)`，两者形状均为 `(batch, traj_lstm_hidden_size)`。
         """
+        device = get_module_device(self)
         return (
-            torch.randn(batch, self.traj_lstm_hidden_size).cuda(),
-            torch.randn(batch, self.traj_lstm_hidden_size).cuda(),
+            torch.randn(batch, self.traj_lstm_hidden_size, device=device),
+            torch.randn(batch, self.traj_lstm_hidden_size, device=device),
         )
 
     def init_hidden_graph_lstm(self, batch):
@@ -532,9 +556,10 @@ class TrajectoryGenerator(nn.Module):
         Returns:
             `(h_0, c_0)`，形状均为 `(batch, graph_lstm_hidden_size)`。
         """
+        device = get_module_device(self)
         return (
-            torch.randn(batch, self.graph_lstm_hidden_size).cuda(),
-            torch.randn(batch, self.graph_lstm_hidden_size).cuda(),
+            torch.randn(batch, self.graph_lstm_hidden_size, device=device),
+            torch.randn(batch, self.graph_lstm_hidden_size, device=device),
         )
 
     def init_hidden_light_lstm(self, batch):
@@ -543,9 +568,10 @@ class TrajectoryGenerator(nn.Module):
         当前生成器主流程没有显式使用独立的 light LSTM，但保留了初始化接口，
         方便和其它实验分支兼容。
         """
+        device = get_module_device(self)
         return (
-            torch.randn(batch, self.traj_lstm_hidden_size).cuda(),
-            torch.randn(batch, self.traj_lstm_hidden_size).cuda(),
+            torch.randn(batch, self.traj_lstm_hidden_size, device=device),
+            torch.randn(batch, self.traj_lstm_hidden_size, device=device),
         )
 
     def add_noise(self, _input, seq_start_end):
@@ -567,7 +593,7 @@ class TrajectoryGenerator(nn.Module):
         """
         noise_shape = (seq_start_end.size(0),) + self.noise_dim
 
-        z_decoder = get_noise(noise_shape, self.noise_type)
+        z_decoder = get_noise(noise_shape, self.noise_type, _input.device)
 
         _list = []
         for idx, (start, end) in enumerate(seq_start_end):
@@ -698,7 +724,7 @@ class TrajectoryGenerator(nn.Module):
         )
         # staend 是给 seqGATEncoder 的“单场景局部窗口索引”，因为这里每次只对
         # 一段局部窗口做聚合，所以起点固定是 0。
-        staend = torch.zeros((1, 2), dtype=torch.int)
+        staend = torch.zeros((1, 2), dtype=torch.int, device=obs_traj_rel.device)
 
         # 3) 对局部时间窗口内的 GAT 输出再做一次序列聚合。
         with torch.no_grad():
@@ -729,7 +755,7 @@ class TrajectoryGenerator(nn.Module):
         pred_lstm_hidden = self.add_noise(
             encoded_before_noise_hidden, seq_start_end
         )
-        pred_lstm_c_t = torch.zeros_like(pred_lstm_hidden).cuda()
+        pred_lstm_c_t = torch.zeros_like(pred_lstm_hidden)
         obs_traj_rel = obs_traj_rel[:, :, 2:4]
         # output 初始化为“最后一个观测位移”，作为未来第一步解码输入。
         output = obs_traj_rel[self.obs_len - 1]
@@ -852,16 +878,18 @@ class TrajectoryDiscriminator(nn.Module):
         Returns:
             `(h_0, c_0)`，形状均为 `(batch, part_lstm_hidden_size)`。
         """
+        device = get_module_device(self)
         return (
-            torch.randn(batch, self.part_lstm_hidden_size).cuda(),
-            torch.randn(batch, self.part_lstm_hidden_size).cuda(),
+            torch.randn(batch, self.part_lstm_hidden_size, device=device),
+            torch.randn(batch, self.part_lstm_hidden_size, device=device),
         )
 
     def init_hidden_merge_lstm(self, batch):
         """初始化融合 LSTM 隐状态。"""
+        device = get_module_device(self)
         return (
-            torch.randn(batch, self.merge_lstm_hidden_size).cuda(),
-            torch.randn(batch, self.merge_lstm_hidden_size).cuda(),
+            torch.randn(batch, self.merge_lstm_hidden_size, device=device),
+            torch.randn(batch, self.merge_lstm_hidden_size, device=device),
         )
 
     def forward(self, traj, state, seq_start_end):

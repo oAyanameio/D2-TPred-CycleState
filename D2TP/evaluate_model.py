@@ -1,9 +1,6 @@
 """评估脚本。"""
 
 import argparse
-import os
-
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import torch
 
 from data.loader import data_loader
@@ -11,7 +8,6 @@ from models import TrajectoryGenerator
 from utils import (
     displacement_error,
     final_displacement_error,
-    l2_loss,
     int_tuple,
     relative_to_abs,
     get_dset_path,
@@ -22,7 +18,7 @@ parser.add_argument("--log_dir", default="./", help="Directory containing loggin
 
 parser.add_argument("--dataset_name", default="VTP_C", type=str)
 parser.add_argument("--delim", default="\t")
-parser.add_argument("--loader_num_workers", default=4, type=int)
+parser.add_argument("--loader_num_workers", default=0, type=int)
 parser.add_argument("--obs_len", default=8, type=int)
 parser.add_argument("--pred_len", default=12, type=int)
 parser.add_argument("--skip", default=1, type=int)
@@ -58,6 +54,17 @@ parser.add_argument("--graph_lstm_hidden_size", default=32, type=int)
 
 
 parser.add_argument("--num_samples", default=20, type=int)
+parser.add_argument(
+    "--device",
+    default="cuda",
+    choices=["cuda", "cpu"],
+    help="评估设备。选择 cuda 时会在可用 GPU 上运行。",
+)
+parser.add_argument(
+    "--pin_memory",
+    action="store_true",
+    help="DataLoader 是否启用 pin_memory。GPU 评估时建议打开。",
+)
 
 
 parser.add_argument(
@@ -116,7 +123,7 @@ def get_generator(checkpoint):
         noise_type=args.noise_type,
     )
     model.load_state_dict(checkpoint["state_dict"])
-    model.cuda()
+    model.to(args.device)
     model.eval()
     return model
 
@@ -134,7 +141,7 @@ def evaluate(args, loader, generator):
     total_traj = 0
     with torch.no_grad():
         for batch in loader:
-            batch = [tensor.cuda() for tensor in batch]
+            batch = [tensor.to(args.device) for tensor in batch]
             (
 
                 obs_traj,
@@ -175,21 +182,38 @@ def evaluate(args, loader, generator):
 
 def main(args):
     """评估入口。"""
-    checkpoint = torch.load(args.resume)
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("请求使用 CUDA，但当前环境中没有可用 GPU。")
+
+    checkpoint = torch.load(args.resume, map_location=args.device)
     generator = get_generator(checkpoint)
     path = get_dset_path(args.dataset_name, args.dset_type)
 
     _, loader = data_loader(args, path)
     ade, fde = evaluate(args, loader, generator)
+    ckpt_best_ade = checkpoint.get("best_ade")
+    if torch.is_tensor(ckpt_best_ade):
+        ckpt_best_ade = ckpt_best_ade.item()
     print(
-        "Dataset: {}, Pred Len: {}, ADE: {:.12f}, FDE: {:.12f}".format(
-            args.dataset_name, args.pred_len, ade, fde
+        "Dataset: {}, Split: {}, Pred Len: {}, Samples: {}, Resume: {}, Checkpoint Best ADE: {}, ADE: {:.12f}, FDE: {:.12f}".format(
+            args.dataset_name,
+            args.dset_type,
+            args.pred_len,
+            args.num_samples,
+            args.resume,
+            "None" if ckpt_best_ade is None else "{:.12f}".format(ckpt_best_ade),
+            ade,
+            fde,
         )
     )
 
 
 if __name__ == "__main__":
     args = parser.parse_args()
+    if args.device == "cuda" and not torch.cuda.is_available():
+        args.device = "cpu"
+    if args.device == "cpu":
+        args.pin_memory = False
     torch.manual_seed(72)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False

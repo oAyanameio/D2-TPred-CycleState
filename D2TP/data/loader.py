@@ -21,5 +21,5 @@ def data_loader(args, path):
         num_workers=args.loader_num_workers,
         # 自定义 collate 函数会把“一个场景内的多目标”拼成模型想要的格式。
         collate_fn=seq_collate,
-        pin_memory=True)
+        pin_memory=getattr(args, "pin_memory", True))
     return dset, loader
