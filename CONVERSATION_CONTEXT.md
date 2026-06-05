@@ -1,65 +1,68 @@
-# Conversation Context For `D2-TPred-CycleState`
+# `D2-TPred-CycleState` 对话上下文
 
-This file is created to "copy" the practical context of the current long-running
-research conversation into the `D2-TPred-CycleState` project workspace.
+这个文件的作用，是把当前这条长研究对话中积累下来的实际项目上下文，
+同步记录到 `D2-TPred-CycleState` 工作区中。
 
-It does not copy the chat thread itself, but it records the project state,
-research direction, implementation progress, and the next recommended actions.
+它并不复制聊天记录本身，而是记录：
+- 当前项目状态
+- 研究方向
+- 已完成的实现进展
+- 接下来推荐推进的动作
 
-## Current Working Project
-- Project path: `/home/lbh/D2-TPred-CycleState`
-- Current branch: `feature/cyclestate-prototype`
-- Purpose:
-  continue implementing and iterating on the new research idea:
-  `CycleState: Full-Cycle Traffic-State Memory for Trajectory Prediction at Signalized Intersections`
+## 当前工作项目
+- 项目路径：`/home/lbh/D2-TPred-CycleState`
+- 当前分支：`main`
+- 目标：
+  - 继续实现并迭代新的研究方向：
+    `CycleState: Full-Cycle Traffic-State Memory for Trajectory Prediction at Signalized Intersections`
 
-## Why This Branch Exists
-The original `D2-TPred` repository is preserved as the reproducible baseline.
-This experimental clone is used to:
-1. avoid polluting the baseline repository
-2. keep a separate research branch for rapid iteration
-3. turn the earlier paper-analysis discussion into a trainable prototype
+## 为什么会有这个项目
+原始 `D2-TPred` 仓库被保留下来作为可复现 baseline。
+这个实验性克隆仓库的用途是：
+1. 避免污染 baseline 仓库
+2. 为快速研究迭代保留独立项目空间
+3. 把之前围绕论文的分析讨论，真正落成一个可训练原型
 
-## Main Research Story
-The current idea is not framed as "just a multi-scale temporal module".
-Instead, it is framed as:
+## 核心科研叙事
+当前思路并不是被表述成“再加一个多尺度时间模块”。
+相反，它被表述为：
 
 `signalized intersection trajectory prediction should be modeled as a full-cycle traffic-state memory problem`
 
-The intended hierarchy is:
-1. micro level: agent motion and local interaction
-2. meso level: lane-level queue-wave state
-3. macro level: signal-cycle state
+对应的层级结构是：
+1. 微观层 `micro`：个体运动与局部交互
+2. 中观层 `meso`：车道级 queue-wave 状态
+3. 宏观层 `macro`：信号周期状态
 
-This framing is chosen to better match high-level publication goals:
-- stronger scientific story
-- less incremental than a generic temporal encoder upgrade
-- easier to argue novelty against prior work
+采用这套表述的原因是：
+- 科研故事更强
+- 相比通用 temporal encoder 升级更不容易显得增量化
+- 更容易与已有方法做新颖性区分
 
-## What Has Already Been Implemented
+## 已经完成的内容
 
-### 1. Experimental generator
-- Added `CycleStateTrajectoryGenerator` in `D2TP/models.py`
-- It reuses the original D2-TPred micro trajectory and graph interaction branches
-- It adds:
-  - queue-state memory branch
-  - cycle-state memory branch
-  - hierarchical decoder initialization
+### 1. 实验生成器
+- 已在 `D2TP/models.py` 中加入 `CycleStateTrajectoryGenerator`
+- 它复用了原始 `D2-TPred` 的微观轨迹与图交互分支
+- 在此基础上新增：
+  - `queue-state memory` 分支
+  - `cycle-state memory` 分支
+  - 分层 decoder 初始化与状态调制
 
-### 2. Training entry integration
-- Added `--model_type {d2tpred, cyclestate}` in training/evaluation
-- Added partial warm-start from original D2-TPred checkpoint
-- For CycleState:
-  - compatible weights are reused
-  - incompatible new layers are randomly initialized
-  - training starts from epoch 0
+### 2. 训练入口集成
+- 已在训练/评估中加入 `--model_type {d2tpred, cyclestate}`
+- 已加入从原始 `D2-TPred` checkpoint 的部分 warm-start
+- 对于 `CycleState`：
+  - 兼容权重会被复用
+  - 不兼容的新层随机初始化
+  - 训练从 epoch 0 开始
 
-### 3. Smoke tests that already passed
-- forward pass works
-- backward pass works
-- partial checkpoint warm-start works
+### 3. 已通过的基础验证
+- forward pass 正常
+- backward pass 正常
+- partial checkpoint warm-start 正常
 
-### 4. Training stabilization utilities
+### 4. 训练稳定化工具
 - `--generator_only`
 - `--aux_queue_weight`
 - `--aux_cycle_weight`
@@ -67,102 +70,110 @@ This framing is chosen to better match high-level publication goals:
 - `--max_train_batches`
 - `--max_val_batches`
 
-### 5. Auxiliary supervision upgrade
-The earlier auxiliary supervision version directly supervised slices of hidden states.
-This has already been improved:
+### 5. Auxiliary supervision 升级
+早期的辅助监督版本是直接监督 hidden state 切片。
+这部分已经被升级为：
 - `queue_aux_head`
 - `cycle_aux_head`
 
-Now the queue/cycle branches explicitly predict auxiliary state targets.
+现在 queue/cycle 分支会显式预测辅助状态目标。
 
-## Quick Experimental Findings Already Observed
+## 已观察到的快速实验现象
 
-### Earlier prototype with GAN
-CycleState could train, but the optimization was noisy.
+### 早期带 GAN 的原型
+`CycleState` 可以训练，但优化过程比较噪。
 
-### Generator-only + auxiliary supervision
-This mode was more stable.
+### 仅生成器 + auxiliary supervision
+这一模式明显更稳定。
 
-Observed trends from quick smoke runs:
-- queue auxiliary loss decreased clearly
-- cycle auxiliary loss also decreased
-- validation ADE/FDE showed a downward trend in short training
+从 quick smoke run 中已经观察到的趋势包括：
+- queue auxiliary loss 明显下降
+- cycle auxiliary loss 也在下降
+- 短训练下验证 ADE/FDE 呈现下降趋势
 
-This means:
-- the CycleState branch is trainable
-- state supervision is useful
-- generator-only is currently a better early-stage mode than full GAN training
+这说明：
+- `CycleState` 分支是可训练的
+- 状态监督是有价值的
+- 在早期阶段，`generator-only` 比完整 GAN 训练更合适
 
-## Files Most Relevant To Continue From Here
+## 后续最重要的文件
 - `README.md`
-  contains the cumulative optimization log and the current research framing
+  - 记录累计优化日志和当前科研叙事
 - `D2TP/models.py`
-  contains the current CycleState prototype
+  - 包含当前 `CycleState` 原型实现
 - `D2TP/train.py`
-  contains training controls and auxiliary loss hooks
+  - 包含训练控制逻辑和辅助损失接线
 - `D2TP/evaluate_model.py`
-  supports `--model_type cyclestate`
+  - 支持 `--model_type cyclestate`
 
-## Current High-Priority Next Steps
-1. strengthen queue-state targets:
-   queue length, release order, stop-line occupancy, front-of-queue status
-2. run a more complete generator-only training experiment
-3. add evaluation-time auxiliary-state analysis
-4. after stable convergence, reintroduce GAN with smaller weight
+## 当前高优先级下一步
+1. 继续加强 `queue-state targets`：
+   - queue length
+   - release order
+   - stop-line occupancy
+   - front-of-queue status
+2. 跑一轮更完整的 `generator-only` 训练实验
+3. 增加评估阶段的辅助状态分析
+4. 在稳定收敛之后，以更小权重重新引入 GAN
 
-## Current Development Shift
-The development mainline has now explicitly shifted to:
+## 当前开发主线转向
+当前主线已经明确转向：
 
 `training-protocol strengthening + INT2 interface compatibility`
 
-This means the immediate focus is no longer on rapidly adding more topology.
-Instead, the priority is to make the current `CycleState` branch:
-1. train under a staged protocol
-2. supervise queue/cycle states with structured losses
-3. support controllable gating ablation
-4. expose a tuple-to-context adapter so future INT2 migration only needs a new adapter layer
+这意味着当前重点不再是快速继续堆模型拓扑，
+而是优先让 `CycleState` 具备以下能力：
+1. 按 staged protocol 训练
+2. 用 structured losses 监督 queue/cycle states
+3. 支持可控 gating ablation
+4. 暴露 tuple-to-context adapter，使未来 INT2 迁移只需替换 adapter 层
 
-## Newest Modeling Upgrade
-The next concrete modeling step after protocol stabilization is:
+## 最新的重要建模升级
+协议稳定之后，一个关键建模升级是：
 
 `Phase-Rolling Queue Memory`
 
-Meaning:
-- queue-state should not stay frozen after decoder initialization
-- instead, the model should roll meso queue-wave state forward during prediction
-- this rollout is conditioned on:
+其含义是：
+- queue-state 不应该在 decoder 初始化后就被冻结
+- 模型应该在预测期内持续滚动 `meso queue-wave state`
+- 这个 rollout 依赖：
   - cycle progression
   - predicted motion
   - last observed queue-state anchor
 
-This keeps the research story coherent:
+这让科研故事保持一致：
 `signalized intersection forecasting as full-cycle traffic-state memory modeling`
-now includes not only state encoding, but also state evolution during the future horizon.
+现在不仅包括状态编码，也包括未来阶段的状态演化。
 
-## Latest Structural Correction
-The newest important correction is:
+## 最新的重要结构修正
+当前最新的重要修正是：
 
 `baseline-compatible decoder state residual`
 
-Meaning:
-- earlier CycleState versions expanded the decoder directly and broke full warm-start
-  compatibility with the original D2-TPred decoder
-- this was likely one major reason for the earlier strong metric degradation
-- the current version keeps the original decoder shape intact and injects state memory
-  through a gated residual pathway
+其含义是：
+- 早期 `CycleState` 版本会直接改宽 decoder，
+  从而破坏原始 `D2-TPred` decoder 的完整 warm-start 兼容性
+- 这很可能是早期指标严重退化的关键原因之一
+- 当前版本保持原始 decoder 形状不变，
+  改为通过 gated residual pathway 注入状态记忆
 
-Current implication:
-- future optimization should treat `protect baseline decoder capability` as a first-order
-  constraint, not a secondary engineering detail
+当前启示是：
+- 后续优化必须把 `protect baseline decoder capability`
+  视作一阶约束，而不是次要工程细节
 
-## Important Constraint From The Ongoing Research Goal
-Further optimization should keep following these requirements:
-1. tell a strong scientific story
-2. aim to exceed the original paper's practical performance
-3. avoid simply copying existing common trajectory-prediction tricks
+## 当前研究目标带来的重要约束
+后续优化必须持续遵守以下要求：
+1. 讲好一个强而完整的科研故事
+2. 目标是超过原始论文的实际性能
+3. 避免简单照搬轨迹预测领域里常见的已有套路
 
-## Practical Note
-From this point on, collaboration should be treated as happening inside
-`D2-TPred-CycleState`, on branch:
+## 实际协作说明
+从现在开始，这条研究协作默认发生在：
 
-`feature/cyclestate-prototype`
+`D2-TPred-CycleState`
+
+并且当前以分支：
+
+`main`
+
+作为持续推进的主线。
