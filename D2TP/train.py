@@ -11,13 +11,18 @@ import shutil
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 
 import gc
 from tensorboardX import SummaryWriter
 import utils
 from data.loader import data_loader
-from models import TrajectoryGenerator,TrajectoryDiscriminator
+from models import (
+    TrajectoryGenerator,
+    TrajectoryDiscriminator,
+    CycleStateTrajectoryGenerator,
+)
 from utils import (
     displacement_error,
     final_displacement_error,
@@ -69,6 +74,18 @@ parser.add_argument(
     help="dims of every node after through GAT module",
 )
 parser.add_argument("--graph_lstm_hidden_size", default=32, type=int)
+parser.add_argument(
+    "--train_stage",
+    default="warmup",
+    choices=["warmup", "refine", "adversarial"],
+    help="CycleState 的阶段化训练协议。warmup/refine 默认只训生成器，adversarial 再引入 GAN。",
+)
+parser.add_argument(
+    "--model_type",
+    default="d2tpred",
+    choices=["d2tpred", "cyclestate"],
+    help="选择训练的生成器类型。",
+)
 
 parser.add_argument(
     "--dropout", type=float, default=0, help="Dropout rate (1 - keep probability)."
@@ -96,9 +113,76 @@ parser.add_argument(
 
 parser.add_argument("--best_k", default=20, type=int)
 parser.add_argument("--print_every", default=10, type=int)
+parser.add_argument(
+    "--max_train_batches",
+    default=0,
+    type=int,
+    help="仅用于快速实验。大于 0 时，每个 epoch 最多训练这么多 batch。",
+)
+parser.add_argument(
+    "--max_val_batches",
+    default=0,
+    type=int,
+    help="仅用于快速实验。大于 0 时，验证时最多评估这么多 batch。",
+)
+parser.add_argument(
+    "--generator_only",
+    action="store_true",
+    default=None,
+    help="只训练生成器，不更新判别器，用于新模型早期稳定训练。",
+)
+parser.add_argument(
+    "--gan_weight",
+    default=None,
+    type=float,
+    help="生成器对抗损失的缩放系数。",
+)
+parser.add_argument(
+    "--aux_queue_weight",
+    default=None,
+    type=float,
+    help="CycleState 的 queue-state 辅助损失权重。",
+)
+parser.add_argument(
+    "--aux_cycle_weight",
+    default=None,
+    type=float,
+    help="CycleState 的 cycle-state 辅助损失权重。",
+)
+parser.add_argument(
+    "--disable_state_gating",
+    action="store_true",
+    help="关闭 phase-conditioned state modulation，用于 CycleState 的 gating 消融。",
+)
+parser.add_argument(
+    "--disable_queue_rollout",
+    action="store_true",
+    help="关闭预测阶段的 phase-rolling queue memory，回退到静态 queue-state 注入。",
+)
+parser.add_argument(
+    "--disable_lane_queue_anchor",
+    action="store_true",
+    help="关闭 lane-level queue consensus anchor，使 queue rollout 只依赖个体局部中观状态。",
+)
+parser.add_argument(
+    "--disable_decoder_state_residual",
+    action="store_true",
+    help="关闭 baseline-compatible decoder state residual，使状态分支不再残差调制原始解码器。",
+)
 parser.add_argument("--use_gpu", default=1, type=int)
 parser.add_argument("--gpu_num", default="2", type=str)
 CUDA_VISIBLE_DEVICES = '2'
+parser.add_argument(
+    "--device",
+    default="cuda",
+    choices=["cuda", "cpu"],
+    help="训练设备。选择 cuda 时会在可用 GPU 上运行。",
+)
+parser.add_argument(
+    "--pin_memory",
+    action="store_true",
+    help="DataLoader 是否启用 pin_memory。GPU 训练时建议打开。",
+)
 parser.add_argument(
     "--resume",
     default="",
@@ -110,16 +194,356 @@ parser.add_argument(
 
 best_ade = 100
 
+TRAIN_STAGE_DEFAULTS = {
+    "warmup": {
+        "generator_only": True,
+        "gan_weight": 0.0,
+        "aux_queue_weight": 10.0,
+        "aux_cycle_weight": 5.0,
+        "teacher_forcing_ratio": 0.8,
+    },
+    "refine": {
+        "generator_only": True,
+        "gan_weight": 0.0,
+        "aux_queue_weight": 3.0,
+        "aux_cycle_weight": 1.5,
+        "teacher_forcing_ratio": 0.6,
+    },
+    "adversarial": {
+        "generator_only": False,
+        "gan_weight": 50.0,
+        "aux_queue_weight": 3.0,
+        "aux_cycle_weight": 1.5,
+        "teacher_forcing_ratio": 0.4,
+    },
+}
+
+BASELINE_DEFAULTS = {
+    "generator_only": False,
+    "gan_weight": 1000.0,
+    "aux_queue_weight": 0.0,
+    "aux_cycle_weight": 0.0,
+    "teacher_forcing_ratio": 0.5,
+}
+
+
+def apply_stage_defaults(args):
+    """根据训练阶段补齐默认超参。
+
+    这里采用“显式阶段协议覆盖默认值、用户传参再优先覆盖”的策略：
+    - parser 默认值设为 `None` 的参数，按阶段自动填充；
+    - 用户如果显式传了值，就保留用户选择。
+    """
+    model_type = getattr(args, "model_type", "cyclestate")
+    stage_defaults = (
+        TRAIN_STAGE_DEFAULTS[args.train_stage]
+        if model_type == "cyclestate"
+        else BASELINE_DEFAULTS
+    )
+    for key, value in stage_defaults.items():
+        if getattr(args, key, None) is None:
+            setattr(args, key, value)
+    return args
+
+
+def build_traffic_context_from_batch(batch):
+    """把 dataloader 返回的 tuple batch 适配成结构化 traffic context。
+
+    目前仍然保留原始 tuple 训练入口，避免一次性改乱仓库。
+    这个 adapter 的作用是先在训练/评估层定义统一语义接口，为后续迁移
+    到 INT2 或其它数据源预留“只换适配层、不重写模型主体”的空间。
+    """
+    (
+        obs_traj,
+        pred_traj_gt,
+        obs_traj_rel,
+        pred_traj_gt_rel,
+        obs_state,
+        pred_state,
+        non_linear_ped,
+        loss_mask,
+        seq_start_end,
+    ) = batch
+    stopline_distance = torch.sqrt(
+        (obs_traj[:, :, 2] - obs_state[:, :, 0]) ** 2
+        + (obs_traj[:, :, 3] - obs_state[:, :, 1]) ** 2
+    )
+    lane_ids = obs_traj[:, :, 4].long()
+    phase_ids = obs_state[:, :, 2].long()
+    phase_elapsed = obs_state[:, :, 3]
+    pred_phase_ids = pred_state[:, :, 2].long()
+    pred_phase_elapsed = pred_state[:, :, 3]
+
+    scene_groups = []
+    lane_grouping = []
+    for start, end in seq_start_end.tolist():
+        scene_groups.append((start, end))
+        lane_grouping.append(lane_ids[-1, start:end].detach().cpu().tolist())
+
+    queue_features = None
+    queue_targets = None
+    cycle_feature_seq = None
+
+    traffic_context = {
+        "agent": {
+            "obs_traj": obs_traj,
+            "pred_traj_gt": pred_traj_gt,
+            "obs_traj_rel": obs_traj_rel,
+            "pred_traj_gt_rel": pred_traj_gt_rel,
+            "direction": obs_traj[:, :, 9],
+            "lane_ids": lane_ids,
+            "stopline_distance": stopline_distance,
+        },
+        "signal": {
+            "obs_state": obs_state,
+            "pred_state": pred_state,
+            "phase_ids": phase_ids,
+            "phase_elapsed": phase_elapsed,
+            "pred_phase_ids": pred_phase_ids,
+            "pred_phase_elapsed": pred_phase_elapsed,
+            "observed_phase": phase_ids,
+            "observed_elapsed": phase_elapsed,
+            "predicted_phase": pred_phase_ids,
+            "predicted_elapsed": pred_phase_elapsed,
+            "cycle_feature_seq": cycle_feature_seq,
+        },
+        "scene": {
+            "seq_start_end": seq_start_end,
+            "scene_groups": scene_groups,
+            "lane_grouping": lane_grouping,
+        },
+        "meso": {
+            "queue_feature_seq": queue_features,
+            "queue_targets": queue_targets,
+        },
+        "meta": {
+            "non_linear_ped": non_linear_ped,
+            "loss_mask": loss_mask,
+        },
+    }
+    return traffic_context
+
+
+def compute_structured_aux_losses(
+    queue_pred_last,
+    queue_target_last,
+    cycle_pred_last,
+    cycle_target_last,
+    queue_rollout_pred_seq=None,
+    queue_rollout_target_seq=None,
+    device=None,
+):
+    """把 queue/cycle 辅助监督拆成更符合语义的分项损失。
+
+    Queue targets:
+    - regression: queue count, waiting ratio, release ratio, lane queue length
+    - binary: stop-line occupancy, front-of-queue flag
+
+    Cycle targets:
+    - phase one-hot(3): classification
+    - elapsed / remaining: regression
+    - phase change: binary classification
+    """
+    if device is None:
+        for tensor in (
+            queue_pred_last,
+            queue_target_last,
+            cycle_pred_last,
+            cycle_target_last,
+        ):
+            if tensor is not None:
+                device = tensor.device
+                break
+    if device is None:
+        device = torch.device("cpu")
+
+    zero = torch.zeros(1, device=device)
+    losses = {
+        "queue_reg_loss": zero.clone(),
+        "queue_cls_loss": zero.clone(),
+        "queue_rollout_reg_loss": zero.clone(),
+        "queue_rollout_cls_loss": zero.clone(),
+        "cycle_phase_loss": zero.clone(),
+        "cycle_time_loss": zero.clone(),
+        "cycle_change_loss": zero.clone(),
+    }
+
+    if queue_pred_last is not None and queue_target_last is not None:
+        queue_reg_idx = [0, 1, 2, 3]
+        queue_cls_idx = [4, 5]
+        losses["queue_reg_loss"] = F.mse_loss(
+            queue_pred_last[:, queue_reg_idx], queue_target_last[:, queue_reg_idx]
+        )
+        losses["queue_cls_loss"] = F.binary_cross_entropy_with_logits(
+            queue_pred_last[:, queue_cls_idx], queue_target_last[:, queue_cls_idx]
+        )
+    if (
+        queue_rollout_pred_seq is not None
+        and queue_rollout_target_seq is not None
+        and queue_rollout_pred_seq.numel() > 0
+    ):
+        queue_reg_idx = [0, 1, 2, 3]
+        queue_cls_idx = [4, 5]
+        rollout_pred_flat = queue_rollout_pred_seq.reshape(-1, queue_rollout_pred_seq.size(-1))
+        rollout_target_flat = queue_rollout_target_seq.reshape(-1, queue_rollout_target_seq.size(-1))
+        losses["queue_rollout_reg_loss"] = F.mse_loss(
+            rollout_pred_flat[:, queue_reg_idx], rollout_target_flat[:, queue_reg_idx]
+        )
+        losses["queue_rollout_cls_loss"] = F.binary_cross_entropy_with_logits(
+            rollout_pred_flat[:, queue_cls_idx], rollout_target_flat[:, queue_cls_idx]
+        )
+
+    if cycle_pred_last is not None and cycle_target_last is not None:
+        phase_target = cycle_target_last[:, :3].argmax(dim=1)
+        losses["cycle_phase_loss"] = F.cross_entropy(
+            cycle_pred_last[:, :3], phase_target
+        )
+        losses["cycle_time_loss"] = F.mse_loss(
+            cycle_pred_last[:, 3:5], cycle_target_last[:, 3:5]
+        )
+        losses["cycle_change_loss"] = F.binary_cross_entropy_with_logits(
+            cycle_pred_last[:, 5:6], cycle_target_last[:, 5:6]
+        )
+
+    losses["queue_total_loss"] = (
+        losses["queue_reg_loss"]
+        + losses["queue_cls_loss"]
+        + losses["queue_rollout_reg_loss"]
+        + losses["queue_rollout_cls_loss"]
+    )
+    losses["cycle_total_loss"] = (
+        losses["cycle_phase_loss"]
+        + losses["cycle_time_loss"]
+        + losses["cycle_change_loss"]
+    )
+    return losses
+
+
+def get_teacher_forcing_ratio(args, epoch):
+    """按训练阶段提供更稳定的 teacher forcing 调度。"""
+    base_ratio = getattr(args, "teacher_forcing_ratio", 0.5)
+    if args.model_type != "cyclestate":
+        return base_ratio
+    if args.train_stage == "warmup":
+        return base_ratio
+
+    epoch_offset = max(epoch - args.start_epoch, 0)
+    decay = 0.02 * epoch_offset
+    if args.train_stage == "refine":
+        return max(0.35, base_ratio - decay)
+    return max(0.2, base_ratio - decay)
+
+
+def prepare_traffic_context(args, model, batch, generator_input):
+    """统一构造 CycleState 使用的 traffic context。"""
+    base_context = build_traffic_context_from_batch(batch)
+    if args.model_type != "cyclestate" or not hasattr(model, "build_traffic_context"):
+        return None
+
+    (
+        obs_traj,
+        pred_traj_gt,
+        obs_traj_rel,
+        pred_traj_gt_rel,
+        obs_state,
+        pred_state,
+        non_linear_ped,
+        loss_mask,
+        seq_start_end,
+    ) = batch
+    traffic_context = model.build_traffic_context(
+        generator_input,
+        obs_traj,
+        obs_state,
+        pred_state,
+        seq_start_end,
+    )
+    traffic_context["scene"].update(base_context["scene"])
+    traffic_context["signal"].update(
+        {
+            "observed_phase": base_context["signal"]["observed_phase"],
+            "observed_elapsed": base_context["signal"]["observed_elapsed"],
+            "predicted_phase": base_context["signal"]["predicted_phase"],
+            "predicted_elapsed": base_context["signal"]["predicted_elapsed"],
+        }
+    )
+    traffic_context["agent"].update(
+        {
+            "pred_traj_gt": pred_traj_gt,
+            "pred_traj_gt_rel": pred_traj_gt_rel,
+        }
+    )
+    traffic_context["meta"] = base_context["meta"]
+    return traffic_context
+
+
+def forward_generator(args, model, batch, teacher_forcing_ratio, training_step=3):
+    """统一封装 d2tpred / cyclestate 的生成器前向调用。"""
+    (
+        obs_traj,
+        pred_traj_gt,
+        obs_traj_rel,
+        pred_traj_gt_rel,
+        obs_state,
+        pred_state,
+        non_linear_ped,
+        loss_mask,
+        seq_start_end,
+    ) = batch
+    if model.training:
+        generator_input = torch.cat((obs_traj_rel, pred_traj_gt_rel), dim=0)
+    else:
+        generator_input = obs_traj_rel
+
+    traffic_context = prepare_traffic_context(args, model, batch, generator_input)
+    if args.model_type == "cyclestate":
+        pred_traj_fake_rel = model(
+            generator_input,
+            obs_traj,
+            obs_state,
+            pred_state,
+            seq_start_end,
+            teacher_forcing_ratio=teacher_forcing_ratio,
+            training_step=training_step,
+            traffic_context=traffic_context,
+        )
+    else:
+        pred_traj_fake_rel = model(
+            generator_input,
+            obs_traj,
+            obs_state,
+            pred_state,
+            seq_start_end,
+            teacher_forcing_ratio=teacher_forcing_ratio,
+            training_step=training_step,
+        )
+    return pred_traj_fake_rel, traffic_context
+
+
+def maybe_load_compatible_weights(model, state_dict):
+    """尽量复用旧 checkpoint 中与当前模型形状兼容的参数。"""
+    model_state = model.state_dict()
+    compatible_state = {}
+    skipped = []
+    for key, value in state_dict.items():
+        if key in model_state and model_state[key].shape == value.shape:
+            compatible_state[key] = value
+        else:
+            skipped.append(key)
+    model_state.update(compatible_state)
+    model.load_state_dict(model_state)
+    return skipped
+
 
 def main(args):
     """训练入口。"""
+    apply_stage_defaults(args)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     train_path = get_dset_path(args.dataset_name, "train")
     val_path = get_dset_path(args.dataset_name, "test")
 
@@ -138,7 +562,12 @@ def main(args):
 
     n_heads = [int(x) for x in args.heads.strip().split(",")]
 
-    model = TrajectoryGenerator(
+    model_cls = (
+        CycleStateTrajectoryGenerator
+        if args.model_type == "cyclestate"
+        else TrajectoryGenerator
+    )
+    model_kwargs = dict(
         obs_len=args.obs_len,
         pred_len=args.pred_len,
         traj_lstm_input_size=args.traj_lstm_input_size,
@@ -152,7 +581,15 @@ def main(args):
         noise_dim=args.noise_dim,
         noise_type=args.noise_type,
     )
-    model.cuda()
+    if args.model_type == "cyclestate":
+        model_kwargs["disable_state_gating"] = args.disable_state_gating
+        model_kwargs["disable_queue_rollout"] = args.disable_queue_rollout
+        model_kwargs["disable_lane_queue_anchor"] = args.disable_lane_queue_anchor
+        model_kwargs["disable_decoder_state_residual"] = (
+            args.disable_decoder_state_residual
+        )
+    model = model_cls(**model_kwargs)
+    model.to(args.device)
     # 判别器用于判断生成轨迹是否像真实数据。
     Discriminator=TrajectoryDiscriminator(
         obs_len=args.obs_len,
@@ -166,17 +603,41 @@ def main(args):
         embedding_size=32,
         light_embedding_size=16,
     )
-    Discriminator.cuda()
+    Discriminator.to(args.device)
 
     optimizer = optim.RMSprop(model.parameters(), lr=1e-3)
     optimizer_d = optim.RMSprop(Discriminator.parameters(), lr=1e-3)
+    logging.info(
+        "Training protocol | model_type=%s stage=%s generator_only=%s gan_weight=%.3f aux_queue=%.3f aux_cycle=%.3f disable_state_gating=%s disable_queue_rollout=%s disable_lane_queue_anchor=%s disable_decoder_state_residual=%s teacher_forcing=%.3f",
+        args.model_type,
+        args.train_stage,
+        args.generator_only,
+        args.gan_weight,
+        args.aux_queue_weight,
+        args.aux_cycle_weight,
+        args.disable_state_gating,
+        args.disable_queue_rollout,
+        args.disable_lane_queue_anchor,
+        args.disable_decoder_state_residual,
+        args.teacher_forcing_ratio,
+    )
     global best_ade
     if args.resume:
         if os.path.isfile(args.resume):
             logging.info("Restoring from checkpoint {}".format(args.resume))
-            checkpoint = torch.load(args.resume)
-            args.start_epoch = checkpoint["epoch"]
-            model.load_state_dict(checkpoint["state_dict"])
+            checkpoint = torch.load(args.resume, map_location=args.device)
+            if args.model_type == "cyclestate":
+                skipped_keys = maybe_load_compatible_weights(
+                    model, checkpoint["state_dict"]
+                )
+                logging.info(
+                    "=> warm-started CycleState from checkpoint, skipped {} keys and kept start_epoch={}".format(
+                        len(skipped_keys), args.start_epoch
+                    )
+                )
+            else:
+                args.start_epoch = checkpoint["epoch"]
+                model.load_state_dict(checkpoint["state_dict"])
             logging.info(
                 "=> loaded checkpoint '{}' (epoch {})".format(
                     args.resume, checkpoint["epoch"]
@@ -191,6 +652,41 @@ def main(args):
     for epoch in range(args.start_epoch, args.num_epochs + 1):
         gc.collect() 
         for batch_idx, batch in enumerate(train_loader):
+            if args.max_train_batches > 0 and batch_idx >= args.max_train_batches:
+                logging.info(
+                    "Reached max_train_batches=%d, stop current epoch early.",
+                    args.max_train_batches,
+                )
+                break
+            if args.generator_only:
+                train(
+                    args,
+                    len(train_loader),
+                    model,
+                    batch_idx,
+                    batch,
+                    Discriminator,
+                    optimizer,
+                    epoch,
+                    training_step,
+                    writer,
+                )
+                if batch_idx % args.print_every == 0:
+                    ade = validate(args, model, val_loader, epoch, writer)
+                    is_best = ade < best_ade
+                    best_ade = min(ade, best_ade)
+                    save_checkpoint(
+                        {
+                            "epoch": epoch + 1,
+                            "state_dict": model.state_dict(),
+                            "best_ade": best_ade,
+                            "optimizer": optimizer.state_dict(),
+                        },
+                        is_best,
+                        os.path.join(args.checkpoint_dir, f"checkpoint{epoch}.pth.tar"),
+                        best_filename=os.path.join(args.checkpoint_dir, "model_best.pth.tar"),
+                    )
+                continue
             if D_step>0:
                 D_train(args,len(train_loader), model,batch_idx,batch,Discriminator, optimizer_d, epoch, training_step, writer)
                 D_step=D_step-1
@@ -210,7 +706,8 @@ def main(args):
                             "optimizer": optimizer.state_dict(),
                         },
                         is_best,
-                        f"./checkpoint/checkpoint{epoch}.pth.tar",
+                        os.path.join(args.checkpoint_dir, f"checkpoint{epoch}.pth.tar"),
+                        best_filename=os.path.join(args.checkpoint_dir, "model_best.pth.tar"),
                     )
     writer.close()
 
@@ -219,11 +716,30 @@ def train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, trai
     """更新生成器。"""
     losses = utils.AverageMeter("L2_Loss", ":.6f")
     g_losses = utils.AverageMeter("G_Loss", ":.6f")
+    aux_queue_reg_losses = utils.AverageMeter("QReg", ":.6f")
+    aux_queue_cls_losses = utils.AverageMeter("QCls", ":.6f")
+    aux_queue_rollout_reg_losses = utils.AverageMeter("QRollReg", ":.6f")
+    aux_queue_rollout_cls_losses = utils.AverageMeter("QRollCls", ":.6f")
+    aux_cycle_phase_losses = utils.AverageMeter("CPhase", ":.6f")
+    aux_cycle_time_losses = utils.AverageMeter("CTime", ":.6f")
+    aux_cycle_change_losses = utils.AverageMeter("CChange", ":.6f")
     progress = utils.ProgressMeter(
-        lens, [losses]+[g_losses], prefix="Epoch: [{}]".format(epoch)
+        lens,
+        [
+            losses,
+            g_losses,
+            aux_queue_reg_losses,
+            aux_queue_cls_losses,
+            aux_queue_rollout_reg_losses,
+            aux_queue_rollout_cls_losses,
+            aux_cycle_phase_losses,
+            aux_cycle_time_losses,
+            aux_cycle_change_losses,
+        ],
+        prefix="Epoch: [{}]".format(epoch),
     )
     model.train()
-    batch = [tensor.cuda() for tensor in batch]
+    batch = [tensor.to(args.device) for tensor in batch]
     (
         obs_traj,
         pred_traj_gt,
@@ -239,19 +755,24 @@ def train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, trai
     optimizer.zero_grad()
     predtrajgt = pred_traj_gt[:, :, 2:4]
     L2_loss = torch.zeros(1).to(predtrajgt)
-    loss = torch.zeros(1).to(predtrajgt)
     l2_loss_rel = []
     loss_mask = loss_mask[:, args.obs_len :]
-
-    model_input = torch.cat((obs_traj_rel, pred_traj_gt_rel), dim=0)
+    teacher_forcing_ratio = get_teacher_forcing_ratio(args, epoch)
+    pred_traj_fake_rel = None
     for _ in range(args.best_k):
         # best-of-K：多次采样，保留误差最小的那次。
-        pred_traj_fake_rel = model(model_input, obs_traj, obs_state, pred_state, seq_start_end, 0)  # ？
-        modinput = model_input[:, :, 2:4]
+        pred_traj_fake_rel, _ = forward_generator(
+            args,
+            model,
+            batch,
+            teacher_forcing_ratio=teacher_forcing_ratio,
+            training_step=training_step,
+        )
+        modinput = pred_traj_gt_rel[:, :, 2:4]
         l2_loss_rel.append(
             l2_loss(
                 pred_traj_fake_rel,
-                modinput[-args.pred_len:],
+                modinput,
                 loss_mask,
                 mode="raw",
             )
@@ -259,8 +780,11 @@ def train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, trai
 
     pred_traj_fake = torch.cat((obs_traj[:,:,2:4],relative_to_abs(pred_traj_fake_rel, obs_traj[-1,:,2:4])),dim=0)
     traj_state=torch.cat((obs_state,pred_state),dim=0)
-    fakesocre=Discriminator(pred_traj_fake,traj_state,seq_start_end)
-    g_loss=gan_g_loss(fakesocre)
+    if args.generator_only:
+        g_loss = torch.zeros(1).to(predtrajgt)
+    else:
+        fakesocre=Discriminator(pred_traj_fake,traj_state,seq_start_end)
+        g_loss=gan_g_loss(fakesocre)
     l2_loss_sum_rel = torch.zeros(1).to(pred_traj_gt)
     l2_loss_rel = torch.stack(l2_loss_rel, dim=1)
 
@@ -273,16 +797,64 @@ def train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, trai
         l2_loss_sum_rel += _l2_loss_rel
 
     L2_loss += l2_loss_sum_rel
-    loss+=1*g_loss
+    aux_losses = compute_structured_aux_losses(
+        None, None, None, None, device=predtrajgt.device
+    )
+    if args.model_type == "cyclestate" and hasattr(model, "debug_last_aux"):
+        aux_info = model.debug_last_aux
+        queue_pred_last = None
+        queue_target_last = None
+        queue_rollout_pred_seq = None
+        queue_rollout_target_seq = None
+        cycle_pred_last = None
+        cycle_target_last = None
+        if args.aux_queue_weight > 0 and aux_info["queue_pred_last"] is not None:
+            queue_pred_last = aux_info["queue_pred_last"]
+            queue_target_last = aux_info["queue_targets"][-1]
+            queue_rollout_pred_seq = aux_info.get("queue_rollout_pred_seq")
+            queue_rollout_target_seq = aux_info.get("queue_rollout_target_seq")
+        if args.aux_cycle_weight > 0 and aux_info["cycle_pred_last"] is not None:
+            cycle_pred_last = aux_info["cycle_pred_last"]
+            cycle_target_last = aux_info["cycle_feature_seq"][-1]
+        aux_losses = compute_structured_aux_losses(
+            queue_pred_last,
+            queue_target_last,
+            cycle_pred_last,
+            cycle_target_last,
+            queue_rollout_pred_seq=queue_rollout_pred_seq,
+            queue_rollout_target_seq=queue_rollout_target_seq,
+            device=predtrajgt.device,
+        )
+    aux_queue_loss = aux_losses["queue_total_loss"]
+    aux_cycle_loss = aux_losses["cycle_total_loss"]
     losses.update(L2_loss.item(), obs_traj.shape[1])
     g_losses.update(g_loss.item(),obs_traj.shape[1])
-    total_loss=L2_loss+g_loss*1000
+    aux_queue_reg_losses.update(aux_losses["queue_reg_loss"].item(), obs_traj.shape[1])
+    aux_queue_cls_losses.update(aux_losses["queue_cls_loss"].item(), obs_traj.shape[1])
+    aux_queue_rollout_reg_losses.update(aux_losses["queue_rollout_reg_loss"].item(), obs_traj.shape[1])
+    aux_queue_rollout_cls_losses.update(aux_losses["queue_rollout_cls_loss"].item(), obs_traj.shape[1])
+    aux_cycle_phase_losses.update(aux_losses["cycle_phase_loss"].item(), obs_traj.shape[1])
+    aux_cycle_time_losses.update(aux_losses["cycle_time_loss"].item(), obs_traj.shape[1])
+    aux_cycle_change_losses.update(aux_losses["cycle_change_loss"].item(), obs_traj.shape[1])
+    total_loss = (
+        L2_loss
+        + g_loss * args.gan_weight
+        + aux_queue_loss * args.aux_queue_weight
+        + aux_cycle_loss * args.aux_cycle_weight
+    )
     total_loss.backward()
     optimizer.step()
     if batch_idx % args.print_every == 0:
         progress.display(batch_idx)
     writer.add_scalar("g_l2_loss", losses.avg, batch_idx)
-    writer.add_scalar("g_ad_loss", g_losses.avg*1000, batch_idx)
+    writer.add_scalar("g_ad_loss", g_losses.avg * args.gan_weight, batch_idx)
+    writer.add_scalar("g_queue_reg_loss", aux_queue_reg_losses.avg, batch_idx)
+    writer.add_scalar("g_queue_cls_loss", aux_queue_cls_losses.avg, batch_idx)
+    writer.add_scalar("g_queue_rollout_reg_loss", aux_queue_rollout_reg_losses.avg, batch_idx)
+    writer.add_scalar("g_queue_rollout_cls_loss", aux_queue_rollout_cls_losses.avg, batch_idx)
+    writer.add_scalar("g_cycle_phase_loss", aux_cycle_phase_losses.avg, batch_idx)
+    writer.add_scalar("g_cycle_time_loss", aux_cycle_time_losses.avg, batch_idx)
+    writer.add_scalar("g_cycle_change_loss", aux_cycle_change_losses.avg, batch_idx)
 
 def D_train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, training_step, writer):
     """更新判别器。"""
@@ -291,7 +863,7 @@ def D_train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, tr
         lens,[D_losses], prefix="Epoch: [{}]".format(epoch)
     )
     model.train()
-    batch = [tensor.cuda() for tensor in batch]
+    batch = [tensor.to(args.device) for tensor in batch]
     (
         obs_traj,
         pred_traj_gt,
@@ -305,8 +877,13 @@ def D_train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, tr
     ) = batch
     optimizer.zero_grad()
 
-    model_input = torch.cat((obs_traj_rel, pred_traj_gt_rel), dim=0)
-    pred_traj_fake_rel = model(model_input, obs_traj, obs_state, pred_state, seq_start_end, 0)  # ？
+    pred_traj_fake_rel, _ = forward_generator(
+        args,
+        model,
+        batch,
+        teacher_forcing_ratio=0.0,
+        training_step=training_step,
+    )
 
     pred_traj_fake = torch.cat((obs_traj[:,:,2:4],relative_to_abs(pred_traj_fake_rel, obs_traj[-1,:,2:4])),dim=0)
     traj_state=torch.cat((obs_state,pred_state),dim=0)
@@ -331,7 +908,13 @@ def validate(args, model, val_loader, epoch, writer):
     model.eval()
     with torch.no_grad():
         for i, batch in enumerate(val_loader):
-            batch = [tensor.cuda() for tensor in batch]
+            if args.max_val_batches > 0 and i >= args.max_val_batches:
+                logging.info(
+                    "Reached max_val_batches=%d, stop validation early.",
+                    args.max_val_batches,
+                )
+                break
+            batch = [tensor.to(args.device) for tensor in batch]
             (
                 obs_traj,
                 pred_traj_gt,
@@ -344,7 +927,13 @@ def validate(args, model, val_loader, epoch, writer):
                 seq_start_end,
             ) = batch
 
-            pred_traj_fake_rel= model(obs_traj_rel, obs_traj,obs_state,pred_state, seq_start_end)
+            pred_traj_fake_rel, _ = forward_generator(
+                args,
+                model,
+                batch,
+                teacher_forcing_ratio=0.0,
+                training_step=3,
+            )
 
             pred_traj_fake_rel_predpart = pred_traj_fake_rel[-args.pred_len :]
             obs_traj = obs_traj[:, :, 2:4]
@@ -371,17 +960,23 @@ def cal_ade_fde(pred_traj_gt, pred_traj_fake):
     return ade, fde
 
 
-def save_checkpoint(state, is_best, filename="checkpoint.pth.tar"):
+def save_checkpoint(state, is_best, filename="checkpoint.pth.tar", best_filename=None):
     if is_best:
         torch.save(state, filename)
         logging.info("-------------- lower ade ----------------")
-        shutil.copyfile(filename, "model_best.pth.tar")
+        if best_filename is None:
+            best_filename = os.path.join(os.path.dirname(filename), "model_best.pth.tar")
+        shutil.copyfile(filename, best_filename)
 
 
 if __name__ == "__main__":
     args = parser.parse_args()
+    if args.device == "cuda" and not torch.cuda.is_available():
+        args.device = "cpu"
+    if args.device == "cpu":
+        args.pin_memory = False
+    os.makedirs(args.log_dir, exist_ok=True)
+    args.checkpoint_dir = os.path.join(args.log_dir, "checkpoint")
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
     utils.set_logger(os.path.join(args.log_dir, "train.log"))
-    checkpoint_dir = "./checkpoint"
-    if os.path.exists(checkpoint_dir) is False:
-        os.mkdir(checkpoint_dir)
     main(args)

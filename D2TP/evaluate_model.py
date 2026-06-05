@@ -4,7 +4,8 @@ import argparse
 import torch
 
 from data.loader import data_loader
-from models import TrajectoryGenerator
+from models import TrajectoryGenerator, CycleStateTrajectoryGenerator
+from train import build_traffic_context_from_batch
 from utils import (
     displacement_error,
     final_displacement_error,
@@ -51,6 +52,32 @@ parser.add_argument(
     help="dims of every node after through GAT module",
 )
 parser.add_argument("--graph_lstm_hidden_size", default=32, type=int)
+parser.add_argument(
+    "--model_type",
+    default="d2tpred",
+    choices=["d2tpred", "cyclestate"],
+    help="选择评估的生成器类型。",
+)
+parser.add_argument(
+    "--disable_state_gating",
+    action="store_true",
+    help="关闭 CycleState 的 phase-conditioned state modulation，用于评估消融模型。",
+)
+parser.add_argument(
+    "--disable_queue_rollout",
+    action="store_true",
+    help="关闭 CycleState 的预测期 queue rollout，用于评估静态 queue-state 版本。",
+)
+parser.add_argument(
+    "--disable_lane_queue_anchor",
+    action="store_true",
+    help="关闭 CycleState 的 lane-level queue consensus anchor，用于评估局部 queue rollout 版本。",
+)
+parser.add_argument(
+    "--disable_decoder_state_residual",
+    action="store_true",
+    help="关闭 CycleState 的 baseline-compatible decoder state residual，用于评估无残差状态注入版本。",
+)
 
 
 parser.add_argument("--num_samples", default=20, type=int)
@@ -108,7 +135,12 @@ def get_generator(checkpoint):
         + [args.graph_lstm_hidden_size]
     )
     n_heads = [int(x) for x in args.heads.strip().split(",")]
-    model = TrajectoryGenerator(
+    model_cls = (
+        CycleStateTrajectoryGenerator
+        if args.model_type == "cyclestate"
+        else TrajectoryGenerator
+    )
+    model_kwargs = dict(
         obs_len=args.obs_len,
         pred_len=args.pred_len,
         traj_lstm_input_size=args.traj_lstm_input_size,
@@ -122,6 +154,14 @@ def get_generator(checkpoint):
         noise_dim=args.noise_dim,
         noise_type=args.noise_type,
     )
+    if args.model_type == "cyclestate":
+        model_kwargs["disable_state_gating"] = args.disable_state_gating
+        model_kwargs["disable_queue_rollout"] = args.disable_queue_rollout
+        model_kwargs["disable_lane_queue_anchor"] = args.disable_lane_queue_anchor
+        model_kwargs["disable_decoder_state_residual"] = (
+            args.disable_decoder_state_residual
+        )
+    model = model_cls(**model_kwargs)
     model.load_state_dict(checkpoint["state_dict"])
     model.to(args.device)
     model.eval()
@@ -160,9 +200,40 @@ def evaluate(args, loader, generator):
 
             for _ in range(args.num_samples):
                 # 同一输入采样多次，得到多模态结果。
-                pred_traj_fake_rel = generator(
-                    obs_traj_rel, obs_traj,obs_state,pred_state,seq_start_end, 0, 3
-                )
+                traffic_context = None
+                if args.model_type == "cyclestate":
+                    base_context = build_traffic_context_from_batch(batch)
+                    traffic_context = generator.build_traffic_context(
+                        obs_traj_rel,
+                        obs_traj,
+                        obs_state,
+                        pred_state,
+                        seq_start_end,
+                    )
+                    traffic_context["scene"].update(base_context["scene"])
+                    traffic_context["signal"].update(
+                        {
+                            "observed_phase": base_context["signal"]["observed_phase"],
+                            "observed_elapsed": base_context["signal"]["observed_elapsed"],
+                            "predicted_phase": base_context["signal"]["predicted_phase"],
+                            "predicted_elapsed": base_context["signal"]["predicted_elapsed"],
+                        }
+                    )
+                    traffic_context["meta"] = base_context["meta"]
+                    pred_traj_fake_rel = generator(
+                        obs_traj_rel,
+                        obs_traj,
+                        obs_state,
+                        pred_state,
+                        seq_start_end,
+                        0,
+                        3,
+                        traffic_context=traffic_context,
+                    )
+                else:
+                    pred_traj_fake_rel = generator(
+                        obs_traj_rel, obs_traj,obs_state,pred_state,seq_start_end, 0, 3
+                    )
                 pred_traj_fake_rel = pred_traj_fake_rel[-args.pred_len :]
 
                 pred_traj_fake = relative_to_abs(pred_traj_fake_rel, obs_traj[-1,:,2:4])
