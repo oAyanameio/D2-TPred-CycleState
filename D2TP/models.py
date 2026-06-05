@@ -842,6 +842,11 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         queue_speed_norm=10.0,
         queue_distance_norm=500.0,
         cycle_time_norm=60.0,
+        phase_duration_limits=(38.0, 47.0, 2.0),
+        disable_state_gating=False,
+        disable_queue_rollout=False,
+        disable_lane_queue_anchor=False,
+        disable_decoder_state_residual=False,
     ):
         super(CycleStateTrajectoryGenerator, self).__init__(
             obs_len=obs_len,
@@ -862,11 +867,14 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         )
         # queue_feature = [
         #   前方排队车辆数, 同车道密度, 同车道平均速度, 同车道等待比例,
-        #   同车道释放比例, 当前灯态编号, 当前灯态持续时间, 自身到停止线距离
+        #   同车道释放比例, 当前灯态编号, 当前灯态持续时间, 自身到停止线距离,
+        #   车道排队长度, 停止线占用, 队首标记
         # ]
-        self.queue_feature_dim = 8
-        # cycle_feature = [phase one-hot(3), elapsed time, phase change flag]
-        self.cycle_feature_dim = 5
+        self.queue_feature_dim = 11
+        # cycle_feature = [
+        #   phase one-hot(3), elapsed time, remaining time, phase change flag
+        # ]
+        self.cycle_feature_dim = 6
         self.queue_lstm_hidden_size = queue_lstm_hidden_size
         self.cycle_lstm_hidden_size = cycle_lstm_hidden_size
         self.queue_speed_threshold = queue_speed_threshold
@@ -875,6 +883,14 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         self.queue_speed_norm = queue_speed_norm
         self.queue_distance_norm = queue_distance_norm
         self.cycle_time_norm = cycle_time_norm
+        self.register_buffer(
+            "phase_duration_limits",
+            torch.tensor(phase_duration_limits, dtype=torch.float32),
+        )
+        self.disable_state_gating = disable_state_gating
+        self.disable_queue_rollout = disable_queue_rollout
+        self.disable_lane_queue_anchor = disable_lane_queue_anchor
+        self.disable_decoder_state_residual = disable_decoder_state_residual
 
         self.queue_feature_embedding = nn.Sequential(
             nn.Linear(self.queue_feature_dim, self.queue_lstm_hidden_size),
@@ -901,34 +917,102 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
             nn.Linear(self.cycle_lstm_hidden_size, self.cycle_lstm_hidden_size),
             nn.ReLU(),
         )
+        # queue rollout:
+        # 观测阶段学到的 queue memory 不应该在整个预测期保持静态不变，
+        # 因为真实路口中的排队/释放波会随着相位推进持续演化。这里显式构造
+        # 一个“预测阶段 queue memory 滚动更新器”，让中观状态在解码期继续前进。
+        self.queue_rollout_feature_mlp = nn.Sequential(
+            nn.Linear(
+                self.queue_feature_dim + self.cycle_feature_dim + 2,
+                self.queue_lstm_hidden_size,
+            ),
+            nn.ReLU(),
+            nn.Linear(self.queue_lstm_hidden_size, self.queue_lstm_hidden_size),
+            nn.ReLU(),
+        )
+        self.queue_rollout_gate = nn.Sequential(
+            nn.Linear(
+                self.light_embedding_size
+                + self.queue_lstm_hidden_size
+                + self.cycle_lstm_hidden_size,
+                self.queue_lstm_hidden_size,
+            ),
+            nn.Sigmoid(),
+        )
+        # lane-consensus 动态融合门：
+        # 不同 phase 下，个体局部 rollout 与车道级中观共识的融合强度不应固定一致。
+        self.lane_queue_anchor_gate = nn.Sequential(
+            nn.Linear(
+                self.queue_feature_dim
+                + self.cycle_feature_dim
+                + self.light_embedding_size,
+                self.queue_feature_dim,
+            ),
+            nn.Sigmoid(),
+        )
         # 显式辅助预测头：
         # 让 queue/cycle 分支不仅“存在”，还要对可解释的中观/宏观状态负责，
         # 比直接截取 hidden 向量前几维做监督更稳、更易解释。
-        self.queue_aux_head = nn.Linear(self.queue_lstm_hidden_size, 3)
-        self.cycle_aux_head = nn.Linear(self.cycle_lstm_hidden_size, 4)
-        self.debug_last_aux = None
-
-        # 新解码器的初始状态除了微观运动与图交互，还会额外注入：
-        # 1. 当前交通灯约束；
-        # 2. 车道级 queue-wave 摘要；
-        # 3. 信号周期级 cycle memory。
-        self.pred_lstm_hidden_size = (
+        self.queue_aux_head = nn.Linear(self.queue_lstm_hidden_size, 6)
+        self.cycle_aux_head = nn.Linear(self.cycle_lstm_hidden_size, 6)
+        # 相位条件门控：
+        # 同样的 queue/cycle 记忆，在红灯、绿灯、黄灯下的作用并不一致。
+        # 这里用显式门控让状态记忆受当前灯态条件调制，而不是简单拼接。
+        self.queue_context_gate = nn.Sequential(
+            nn.Linear(
+                self.light_embedding_size
+                + self.queue_lstm_hidden_size
+                + self.cycle_lstm_hidden_size,
+                self.queue_lstm_hidden_size,
+            ),
+            nn.Sigmoid(),
+        )
+        self.cycle_context_gate = nn.Sequential(
+            nn.Linear(
+                self.light_embedding_size
+                + self.queue_lstm_hidden_size
+                + self.cycle_lstm_hidden_size,
+                self.cycle_lstm_hidden_size,
+            ),
+            nn.Sigmoid(),
+        )
+        self.decode_cycle_gate = nn.Sequential(
+            nn.Linear(
+                self.light_embedding_size + self.cycle_lstm_hidden_size,
+                self.cycle_lstm_hidden_size,
+            ),
+            nn.Sigmoid(),
+        )
+        # baseline-compatible decoder state residual:
+        # 不再把解码器主干直接改宽，而是保持原 D2-TPred 解码器形状不变，
+        # 通过残差方式把 queue/cycle memory 注入进去。这样可以完整 warm-start
+        # 原始解码器参数，把新状态分支的学习压力从“重学主干”降为“逐步调制主干”。
+        self.decoder_state_context_dim = (
             self.light_embedding_size
-            + self.traj_lstm_hidden_size
-            + self.graph_lstm_hidden_size
             + self.queue_lstm_hidden_size
             + self.cycle_lstm_hidden_size
-            + noise_dim[0]
         )
-        self.pred_lstm_model = nn.LSTMCell(
-            traj_lstm_input_size, self.pred_lstm_hidden_size
+        self.decoder_state_residual = nn.Sequential(
+            nn.Linear(
+                self.decoder_state_context_dim, self.pred_lstm_hidden_size
+            ),
+            nn.ReLU(),
+            nn.Linear(self.pred_lstm_hidden_size, self.pred_lstm_hidden_size),
+            nn.Tanh(),
         )
-        self.pred_hidden2pos = nn.Linear(
-            self.light_embedding_size
-            + self.cycle_lstm_hidden_size
-            + self.pred_lstm_hidden_size,
-            2,
+        self.decoder_state_gate = nn.Sequential(
+            nn.Linear(
+                self.decoder_state_context_dim, self.pred_lstm_hidden_size
+            ),
+            nn.ReLU(),
+            nn.Linear(self.pred_lstm_hidden_size, self.pred_lstm_hidden_size),
+            nn.Sigmoid(),
         )
+        nn.init.zeros_(self.decoder_state_residual[2].weight)
+        nn.init.zeros_(self.decoder_state_residual[2].bias)
+        nn.init.zeros_(self.decoder_state_gate[2].weight)
+        nn.init.constant_(self.decoder_state_gate[2].bias, -2.0)
+        self.debug_last_aux = None
 
     def init_hidden_queue_lstm(self, batch):
         """初始化 queue memory 的隐状态。"""
@@ -953,25 +1037,35 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
             state_seq: `(T, batch, 4)`，通道含义与数据集中的 `obs_state` 一致。
 
         Returns:
-            cycle_feature: `(T, batch, 5)`，包含 one-hot 灯态、持续时间归一化以及
-            灯态是否变化的标记。
+            cycle_feature: `(T, batch, 6)`，包含 one-hot 灯态、已持续时间、
+            剩余时间以及灯态是否变化的标记。
         """
         phase = state_seq[:, :, 2].long().clamp(min=0, max=2)
         phase_one_hot = F.one_hot(phase, num_classes=3).float()
-        elapsed = (state_seq[:, :, 3:4] / self.cycle_time_norm).clamp(min=0.0, max=2.0)
+        elapsed_raw = state_seq[:, :, 3:4]
+        elapsed = (elapsed_raw / self.cycle_time_norm).clamp(min=0.0, max=2.0)
+        phase_limits = self.phase_duration_limits[phase].unsqueeze(2)
+        remaining = ((phase_limits - elapsed_raw) / self.cycle_time_norm).clamp(
+            min=0.0, max=2.0
+        )
         phase_change = torch.zeros(
             state_seq.size(0), state_seq.size(1), 1, device=state_seq.device
         )
         phase_change[1:] = (phase[1:] != phase[:-1]).float().unsqueeze(2)
-        return torch.cat((phase_one_hot, elapsed, phase_change), dim=2)
+        return torch.cat((phase_one_hot, elapsed, remaining, phase_change), dim=2)
 
     def get_step_cycle_feature(self, state_frame):
         """构造单步解码阶段使用的周期状态特征。"""
         phase = state_frame[:, 2].long().clamp(min=0, max=2)
         phase_one_hot = F.one_hot(phase, num_classes=3).float()
-        elapsed = (state_frame[:, 3:4] / self.cycle_time_norm).clamp(min=0.0, max=2.0)
+        elapsed_raw = state_frame[:, 3:4]
+        elapsed = (elapsed_raw / self.cycle_time_norm).clamp(min=0.0, max=2.0)
+        phase_limits = self.phase_duration_limits[phase].unsqueeze(1)
+        remaining = ((phase_limits - elapsed_raw) / self.cycle_time_norm).clamp(
+            min=0.0, max=2.0
+        )
         phase_change = torch.zeros(state_frame.size(0), 1, device=state_frame.device)
-        return torch.cat((phase_one_hot, elapsed, phase_change), dim=1)
+        return torch.cat((phase_one_hot, elapsed, remaining, phase_change), dim=1)
 
     def build_queue_features(self, obs_traj_pos, obs_traj_rel, obs_state, seq_start_end):
         """从观测窗口中提取车道级 queue-wave 弱标签特征。
@@ -986,7 +1080,11 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         - 当前灯态持续时间
         - 自身到停止线距离
 
-        这些量足以让第一版模型学到“排队-释放-未释放”的中观状态差异。
+        这些量让中观状态不再只是“是否拥堵”的粗描述，而是更接近：
+        - 队列有多长
+        - 当前车是否靠近队首
+        - 停止线附近是否已被占用
+        - 车道是否处在释放波阶段
         """
         obs_len, batch = obs_traj_pos.size(0), obs_traj_pos.size(1)
         device = obs_traj_pos.device
@@ -1027,6 +1125,10 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
 
                 queue_count = ahead_mask.float().sum(dim=1) / self.queue_count_norm
                 lane_density = (lane_count - 1.0) / self.queue_count_norm
+                lane_wait_count = (
+                    torch.matmul(same_lane.float(), waiting.unsqueeze(1)).squeeze(1)
+                    / self.queue_count_norm
+                )
                 lane_mean_speed = (
                     torch.matmul(same_lane.float(), scene_speed.unsqueeze(1)).squeeze(1)
                     / lane_count
@@ -1040,6 +1142,19 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                     torch.matmul(same_lane.float(), releasing.unsqueeze(1)).squeeze(1)
                     / lane_count
                 )
+                stopline_mask = (
+                    scene_stop_dist < self.queue_distance_threshold
+                ).float()
+                lane_stopline_occupancy = (
+                    torch.matmul(
+                        same_lane.float(), stopline_mask.unsqueeze(1)
+                    ).squeeze(1)
+                    > 0
+                ).float()
+                front_of_queue = (
+                    (ahead_mask.float().sum(dim=1) == 0)
+                    & (scene_stop_dist < self.queue_distance_threshold)
+                ).float()
                 own_stop_dist = scene_stop_dist / self.queue_distance_norm
 
                 queue_features[t, start:end, :] = torch.stack(
@@ -1052,6 +1167,9 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                         phase_value[t, start:end],
                         elapsed_value[t, start:end],
                         own_stop_dist,
+                        lane_wait_count,
+                        lane_stopline_occupancy,
+                        front_of_queue,
                     ],
                     dim=1,
                 )
@@ -1059,15 +1177,230 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         return queue_features
 
     def compute_queue_targets(self, queue_feature_seq):
-        """把弱标签统计量转成辅助监督目标。"""
+        """把中观 queue-wave 统计量转成更强的辅助监督目标。"""
         return torch.stack(
             (
                 queue_feature_seq[:, :, 0],
                 queue_feature_seq[:, :, 3],
                 queue_feature_seq[:, :, 4],
+                queue_feature_seq[:, :, 8],
+                queue_feature_seq[:, :, 9],
+                queue_feature_seq[:, :, 10],
             ),
             dim=2,
         )
+
+    def build_lane_queue_anchor_seq(self, queue_feature_seq, lane_ids, seq_start_end):
+        """构造同车道一致性中观锚点。
+
+        直觉上，中观 queue-wave 状态不应完全由单个 agent 的局部特征决定；
+        同一条 lane 上的车辆应共享一个更平滑的“车道级状态共识”。
+        """
+        anchor_seq = queue_feature_seq.clone()
+        for start, end in seq_start_end.tolist():
+            for t in range(queue_feature_seq.size(0)):
+                scene_lane_ids = lane_ids[t, start:end]
+                scene_queue = queue_feature_seq[t, start:end]
+                unique_lane_ids = torch.unique(scene_lane_ids)
+                for lane_id in unique_lane_ids:
+                    lane_mask = scene_lane_ids == lane_id
+                    lane_mean = scene_queue[lane_mask].mean(dim=0, keepdim=True)
+                    anchor_seq[t, start:end][lane_mask] = lane_mean.expand(
+                        lane_mask.sum(), -1
+                    )
+        return anchor_seq
+
+    def rollout_queue_features(
+        self,
+        base_queue_feature,
+        current_cycle_feature,
+        last_pred_offset,
+        step_index,
+    ):
+        """根据预测阶段的相位推进，显式滚动 queue-wave 特征。
+
+        设计动机：
+        观测阶段的 queue feature 只能描述“看到的最后一刻”，但在解码期，
+        队列会继续随相位推进而积累或释放。这里用一个轻量、可学习但物理上可解释的
+        rollout 近似，让队列记忆变成一个“相位演化过程”。
+        """
+        phase_one_hot = current_cycle_feature[:, :3]
+        elapsed = current_cycle_feature[:, 3:4]
+        remaining = current_cycle_feature[:, 4:5]
+        phase_change = current_cycle_feature[:, 5:6]
+        phase_id = phase_one_hot.argmax(dim=1)
+
+        rolled = base_queue_feature.clone()
+        waiting_ratio = rolled[:, 3]
+        release_ratio = rolled[:, 4]
+        phase_value = rolled[:, 5]
+        elapsed_value = rolled[:, 6]
+        stop_dist = rolled[:, 7]
+        lane_queue_length = rolled[:, 8]
+        stopline_occupancy = rolled[:, 9]
+        front_of_queue = rolled[:, 10]
+
+        is_red_like = (phase_id == 0).float()
+        is_green_like = (phase_id == 1).float()
+        is_yellow_like = (phase_id == 2).float()
+        pred_speed = last_pred_offset.norm(dim=1).clamp(max=self.queue_speed_threshold)
+        pred_speed_norm = pred_speed / max(self.queue_speed_threshold, 1e-6)
+        progress = elapsed.squeeze(1).clamp(min=0.0, max=2.0) / 2.0
+        remaining_progress = remaining.squeeze(1).clamp(min=0.0, max=2.0) / 2.0
+
+        waiting_ratio = torch.clamp(
+            waiting_ratio
+            + 0.08 * is_red_like * (1.0 - progress)
+            + 0.03 * is_yellow_like
+            - 0.12 * is_green_like * pred_speed_norm,
+            min=0.0,
+            max=1.0,
+        )
+        release_ratio = torch.clamp(
+            release_ratio
+            + 0.14 * is_green_like * (1.0 - remaining_progress + pred_speed_norm)
+            - 0.08 * is_red_like
+            - 0.04 * is_yellow_like,
+            min=0.0,
+            max=1.0,
+        )
+        lane_queue_length = torch.clamp(
+            lane_queue_length
+            + 0.10 * is_red_like
+            + 0.03 * is_yellow_like
+            - 0.12 * is_green_like * pred_speed_norm
+            + 0.05 * phase_change.squeeze(1),
+            min=0.0,
+            max=1.5,
+        )
+        stopline_occupancy = torch.clamp(
+            stopline_occupancy
+            + 0.10 * is_red_like
+            - 0.12 * is_green_like * pred_speed_norm,
+            min=0.0,
+            max=1.0,
+        )
+        front_of_queue = torch.clamp(
+            front_of_queue
+            + 0.05 * is_red_like
+            - 0.05 * is_green_like * pred_speed_norm,
+            min=0.0,
+            max=1.0,
+        )
+        # 随着车辆预测位置向前推进，距离停止线逐步减小；相位切换会带来轻微不连续调整。
+        step_discount = float(step_index + 1) / float(max(self.pred_len, 1))
+        stop_dist = torch.clamp(
+            stop_dist - 0.08 * pred_speed_norm - 0.03 * step_discount + 0.02 * phase_change.squeeze(1),
+            min=0.0,
+            max=2.0,
+        )
+        queue_count = torch.clamp(
+            waiting_ratio * (lane_queue_length + 0.5 * stopline_occupancy),
+            min=0.0,
+            max=1.5,
+        )
+        lane_density = torch.clamp(
+            0.6 * rolled[:, 1] + 0.4 * lane_queue_length,
+            min=0.0,
+            max=1.5,
+        )
+        lane_mean_speed = torch.clamp(
+            0.6 * rolled[:, 2]
+            + 0.4 * (
+                pred_speed / max(self.queue_speed_norm, 1e-6)
+            ),
+            min=0.0,
+            max=1.5,
+        )
+        phase_value = phase_id.float() / 2.0
+        elapsed_value = elapsed.squeeze(1).clamp(min=0.0, max=2.0)
+
+        rolled[:, 0] = queue_count
+        rolled[:, 1] = lane_density
+        rolled[:, 2] = lane_mean_speed
+        rolled[:, 3] = waiting_ratio
+        rolled[:, 4] = release_ratio
+        rolled[:, 5] = phase_value
+        rolled[:, 6] = elapsed_value
+        rolled[:, 7] = stop_dist
+        rolled[:, 8] = lane_queue_length
+        rolled[:, 9] = stopline_occupancy
+        rolled[:, 10] = front_of_queue
+        return rolled
+
+    def build_traffic_context(
+        self,
+        obs_traj_rel,
+        obs_traj_pos,
+        obs_state,
+        pred_state,
+        seq_start_end,
+    ):
+        """把当前 tuple 风格输入统一组织成结构化 traffic context。
+
+        这样做的目的不是立刻重写整个数据流，而是先给模型内部一个更清晰的
+        统一接口，后续迁移到 INT2 时只需要替换 adapter，而不必重写核心模型。
+        """
+        queue_feature_seq = self.build_queue_features(
+            obs_traj_pos, obs_traj_rel, obs_state, seq_start_end
+        )
+        cycle_feature_seq = self.build_cycle_features(obs_state)
+        stopline_distance = torch.sqrt(
+            (obs_traj_pos[:, :, 2] - obs_state[:, :, 0]) ** 2
+            + (obs_traj_pos[:, :, 3] - obs_state[:, :, 1]) ** 2
+        )
+        lane_ids = obs_traj_pos[:, :, 4].long()
+        phase_ids = obs_state[:, :, 2].long()
+        phase_elapsed = obs_state[:, :, 3]
+        pred_phase_ids = pred_state[:, :, 2].long()
+        pred_phase_elapsed = pred_state[:, :, 3]
+        lane_queue_anchor_seq = self.build_lane_queue_anchor_seq(
+            queue_feature_seq, lane_ids, seq_start_end
+        )
+
+        traffic_context = {
+            "agent": {
+                "obs_traj": obs_traj_pos,
+                "obs_traj_rel": obs_traj_rel,
+                "lane_ids": lane_ids,
+                "direction": obs_traj_pos[:, :, 9],
+                "stopline_distance": stopline_distance,
+            },
+            "signal": {
+                "obs_state": obs_state,
+                "pred_state": pred_state,
+                "phase_ids": phase_ids,
+                "phase_elapsed": phase_elapsed,
+                "pred_phase_ids": pred_phase_ids,
+                "pred_phase_elapsed": pred_phase_elapsed,
+                "cycle_feature_seq": cycle_feature_seq,
+            },
+            "scene": {
+                "seq_start_end": seq_start_end,
+            },
+            "meso": {
+                "queue_feature_seq": queue_feature_seq,
+                "lane_queue_anchor_seq": lane_queue_anchor_seq,
+                "queue_targets": self.compute_queue_targets(queue_feature_seq),
+            },
+        }
+        return traffic_context
+
+    def build_decoder_state_residual(
+        self,
+        light_state_embedding,
+        queue_context,
+        cycle_context,
+    ):
+        """把交通状态记忆映射成与 baseline 解码器同维的残差调制量。"""
+        if self.disable_decoder_state_residual:
+            return None
+        decoder_state_context = torch.cat(
+            (light_state_embedding, queue_context, cycle_context), dim=1
+        )
+        state_residual = self.decoder_state_residual(decoder_state_context)
+        state_gate = self.decoder_state_gate(decoder_state_context)
+        return state_gate * state_residual
 
     def forward(
         self,
@@ -1078,6 +1411,7 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         seq_start_end,
         teacher_forcing_ratio=0.5,
         training_step=3,
+        traffic_context=None,
     ):
         """CycleState v0 的完整生成流程。"""
         batch = obs_traj_rel.shape[1]
@@ -1091,18 +1425,29 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         queue_lstm_hidden_states = []
         cycle_lstm_hidden_states = []
 
-        queue_feature_seq = self.build_queue_features(
-            obs_traj_pos, obs_traj_rel, obs_state, seq_start_end
-        )
-        cycle_feature_seq = self.build_cycle_features(obs_state)
+        if traffic_context is None:
+            traffic_context = self.build_traffic_context(
+                obs_traj_rel, obs_traj_pos, obs_state, pred_state, seq_start_end
+            )
+        queue_feature_seq = traffic_context["meso"]["queue_feature_seq"]
+        lane_queue_anchor_seq = traffic_context["meso"]["lane_queue_anchor_seq"]
+        cycle_feature_seq = traffic_context["signal"]["cycle_feature_seq"]
         self.debug_last_aux = {
             "queue_feature_seq": queue_feature_seq.detach(),
-            "queue_targets": self.compute_queue_targets(queue_feature_seq).detach(),
+            "lane_queue_anchor_seq": lane_queue_anchor_seq.detach(),
+            "queue_targets": traffic_context["meso"]["queue_targets"].detach(),
             "cycle_feature_seq": cycle_feature_seq.detach(),
             "queue_hidden_last": None,
             "cycle_hidden_last": None,
             "queue_pred_last": None,
             "cycle_pred_last": None,
+            "queue_rollout_hidden_seq": None,
+            "queue_rollout_pred_seq": None,
+            "queue_rollout_target_seq": None,
+            "lane_queue_rollout_anchor_seq": None,
+            "decoder_state_init_residual": None,
+            "decoder_state_step_residual_seq": None,
+            "traffic_context": traffic_context,
         }
 
         for input_t in obs_traj_rel[: self.obs_len].chunk(self.obs_len, dim=0):
@@ -1148,31 +1493,55 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
 
         light_state = self.get_last_state(obs_traj_pos, obs_state)
         light_state_embedding = self.light_embedding(light_state)
+        queue_last = queue_lstm_hidden_states[-1]
+        cycle_last = cycle_lstm_hidden_states[-1]
+        if self.disable_state_gating:
+            gated_queue_last = queue_last
+            gated_cycle_last = cycle_last
+        else:
+            phase_gate_input = torch.cat(
+                (light_state_embedding, queue_last, cycle_last), dim=1
+            )
+            gated_queue_last = queue_last * self.queue_context_gate(phase_gate_input)
+            gated_cycle_last = cycle_last * self.cycle_context_gate(phase_gate_input)
         encoded_before_noise_hidden = torch.cat(
             (
                 light_state_embedding,
                 traj_lstm_hidden_states[-1],
                 graph_lstm_hidden_states[-1],
-                queue_lstm_hidden_states[-1],
-                cycle_lstm_hidden_states[-1],
             ),
             dim=1,
         )
-        self.debug_last_aux["queue_hidden_last"] = queue_lstm_hidden_states[-1]
-        self.debug_last_aux["cycle_hidden_last"] = cycle_lstm_hidden_states[-1]
+        self.debug_last_aux["queue_hidden_last"] = gated_queue_last
+        self.debug_last_aux["cycle_hidden_last"] = gated_cycle_last
         self.debug_last_aux["queue_pred_last"] = self.queue_aux_head(
-            queue_lstm_hidden_states[-1]
+            gated_queue_last
         )
         self.debug_last_aux["cycle_pred_last"] = self.cycle_aux_head(
-            cycle_lstm_hidden_states[-1]
+            gated_cycle_last
         )
-        pred_lstm_hidden = self.add_noise(
-            encoded_before_noise_hidden, seq_start_end
+        pred_lstm_hidden = self.add_noise(encoded_before_noise_hidden, seq_start_end)
+        init_state_residual = self.build_decoder_state_residual(
+            light_state_embedding, gated_queue_last, gated_cycle_last
         )
+        if init_state_residual is not None:
+            pred_lstm_hidden = pred_lstm_hidden + init_state_residual
+            self.debug_last_aux["decoder_state_init_residual"] = (
+                init_state_residual.detach()
+            )
         pred_lstm_c_t = torch.zeros_like(pred_lstm_hidden)
 
         obs_traj_rel = obs_traj_rel[:, :, 2:4]
         output = obs_traj_rel[self.obs_len - 1]
+        queue_rollout_hidden_seq = []
+        queue_rollout_pred_seq = []
+        queue_rollout_target_seq = []
+        lane_queue_rollout_anchor_seq = []
+        decoder_state_residual_seq = []
+        rollout_queue_h_t = gated_queue_last
+        rollout_queue_c_t = torch.zeros_like(gated_queue_last)
+        base_queue_feature = queue_feature_seq[-1]
+        lane_queue_anchor = lane_queue_anchor_seq[-1]
         if self.training:
             for i, input_t in enumerate(
                 obs_traj_rel[-self.pred_len :].chunk(self.pred_len, dim=0)
@@ -1196,10 +1565,71 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                 cycle_step_embedding = self.cycle_step_embedding(
                     current_cycle_feature
                 )
-                pred_input = torch.cat(
-                    (light_state_embedding, cycle_step_embedding, pred_lstm_hidden),
-                    dim=1,
+                if not self.disable_queue_rollout:
+                    current_queue_feature = self.rollout_queue_features(
+                        base_queue_feature,
+                        current_cycle_feature,
+                        input_t.squeeze(0),
+                        i,
+                    )
+                    if not self.disable_lane_queue_anchor:
+                        lane_queue_rollout_anchor_seq.append(lane_queue_anchor)
+                        lane_anchor_gate = self.lane_queue_anchor_gate(
+                            torch.cat(
+                                (
+                                    current_queue_feature,
+                                    current_cycle_feature,
+                                    light_state_embedding,
+                                ),
+                                dim=1,
+                            )
+                        )
+                        current_queue_feature = (
+                            (1.0 - lane_anchor_gate) * current_queue_feature
+                            + lane_anchor_gate * lane_queue_anchor
+                        )
+                    queue_rollout_input = torch.cat(
+                        (current_queue_feature, current_cycle_feature, input_t.squeeze(0)),
+                        dim=1,
+                    )
+                    queue_rollout_embed = self.queue_rollout_feature_mlp(
+                        queue_rollout_input
+                    )
+                    rollout_queue_h_t, rollout_queue_c_t = self.queue_lstm_model(
+                        queue_rollout_embed, (rollout_queue_h_t, rollout_queue_c_t)
+                    )
+                    if not self.disable_state_gating:
+                        rollout_queue_h_t = rollout_queue_h_t * self.queue_rollout_gate(
+                            torch.cat(
+                                (
+                                    light_state_embedding,
+                                    rollout_queue_h_t,
+                                    cycle_step_embedding,
+                                ),
+                                dim=1,
+                            )
+                        )
+                    queue_rollout_hidden_seq.append(rollout_queue_h_t)
+                    queue_rollout_pred_seq.append(self.queue_aux_head(rollout_queue_h_t))
+                    queue_rollout_target_seq.append(
+                        self.compute_queue_targets(current_queue_feature.unsqueeze(0)).squeeze(0)
+                    )
+                    queue_context_for_decode = rollout_queue_h_t
+                else:
+                    queue_context_for_decode = gated_queue_last
+                if not self.disable_state_gating:
+                    cycle_step_embedding = cycle_step_embedding * self.decode_cycle_gate(
+                        torch.cat((light_state_embedding, cycle_step_embedding), dim=1)
+                    )
+                step_state_residual = self.build_decoder_state_residual(
+                    light_state_embedding,
+                    queue_context_for_decode,
+                    cycle_step_embedding,
                 )
+                if step_state_residual is not None:
+                    pred_lstm_hidden = pred_lstm_hidden + step_state_residual
+                    decoder_state_residual_seq.append(step_state_residual)
+                pred_input = torch.cat((light_state_embedding, pred_lstm_hidden), dim=1)
                 output = self.pred_hidden2pos(pred_input)
                 pred_traj_rel += [output]
         else:
@@ -1221,13 +1651,92 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                 cycle_step_embedding = self.cycle_step_embedding(
                     current_cycle_feature
                 )
-                pred_input = torch.cat(
-                    (light_state_embedding, cycle_step_embedding, pred_lstm_hidden),
-                    dim=1,
+                if not self.disable_queue_rollout:
+                    current_queue_feature = self.rollout_queue_features(
+                        base_queue_feature,
+                        current_cycle_feature,
+                        output,
+                        i,
+                    )
+                    if not self.disable_lane_queue_anchor:
+                        lane_queue_rollout_anchor_seq.append(lane_queue_anchor)
+                        lane_anchor_gate = self.lane_queue_anchor_gate(
+                            torch.cat(
+                                (
+                                    current_queue_feature,
+                                    current_cycle_feature,
+                                    light_state_embedding,
+                                ),
+                                dim=1,
+                            )
+                        )
+                        current_queue_feature = (
+                            (1.0 - lane_anchor_gate) * current_queue_feature
+                            + lane_anchor_gate * lane_queue_anchor
+                        )
+                    queue_rollout_input = torch.cat(
+                        (current_queue_feature, current_cycle_feature, output),
+                        dim=1,
+                    )
+                    queue_rollout_embed = self.queue_rollout_feature_mlp(
+                        queue_rollout_input
+                    )
+                    rollout_queue_h_t, rollout_queue_c_t = self.queue_lstm_model(
+                        queue_rollout_embed, (rollout_queue_h_t, rollout_queue_c_t)
+                    )
+                    if not self.disable_state_gating:
+                        rollout_queue_h_t = rollout_queue_h_t * self.queue_rollout_gate(
+                            torch.cat(
+                                (
+                                    light_state_embedding,
+                                    rollout_queue_h_t,
+                                    cycle_step_embedding,
+                                ),
+                                dim=1,
+                            )
+                        )
+                    queue_rollout_hidden_seq.append(rollout_queue_h_t)
+                    queue_rollout_pred_seq.append(self.queue_aux_head(rollout_queue_h_t))
+                    queue_rollout_target_seq.append(
+                        self.compute_queue_targets(current_queue_feature.unsqueeze(0)).squeeze(0)
+                    )
+                    queue_context_for_decode = rollout_queue_h_t
+                else:
+                    queue_context_for_decode = gated_queue_last
+                if not self.disable_state_gating:
+                    cycle_step_embedding = cycle_step_embedding * self.decode_cycle_gate(
+                        torch.cat((light_state_embedding, cycle_step_embedding), dim=1)
+                    )
+                step_state_residual = self.build_decoder_state_residual(
+                    light_state_embedding,
+                    queue_context_for_decode,
+                    cycle_step_embedding,
                 )
+                if step_state_residual is not None:
+                    pred_lstm_hidden = pred_lstm_hidden + step_state_residual
+                    decoder_state_residual_seq.append(step_state_residual)
+                pred_input = torch.cat((light_state_embedding, pred_lstm_hidden), dim=1)
                 output = self.pred_hidden2pos(pred_input)
                 pred_traj_rel += [output]
 
+        if queue_rollout_hidden_seq:
+            self.debug_last_aux["queue_rollout_hidden_seq"] = torch.stack(
+                queue_rollout_hidden_seq
+            )
+            self.debug_last_aux["queue_rollout_pred_seq"] = torch.stack(
+                queue_rollout_pred_seq
+            )
+            self.debug_last_aux["queue_rollout_target_seq"] = torch.stack(
+                queue_rollout_target_seq
+            )
+        if lane_queue_rollout_anchor_seq:
+            self.debug_last_aux["lane_queue_rollout_anchor_seq"] = torch.stack(
+                lane_queue_rollout_anchor_seq
+            )
+        if decoder_state_residual_seq:
+            self.debug_last_aux["decoder_state_step_residual_seq"] = torch.stack(
+                decoder_state_residual_seq
+            )
         return torch.stack(pred_traj_rel)
 
 
