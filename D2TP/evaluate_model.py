@@ -5,10 +5,12 @@ import torch
 
 from data.loader import data_loader
 from models import TrajectoryGenerator, CycleStateTrajectoryGenerator
-from train import build_traffic_context_from_batch
+from train import (
+    build_traffic_context_from_batch,
+    compute_best_of_k_metric_sums,
+    compute_raw_displacement_metrics,
+)
 from utils import (
-    displacement_error,
-    final_displacement_error,
     int_tuple,
     relative_to_abs,
     get_dset_path,
@@ -82,6 +84,18 @@ parser.add_argument(
 
 parser.add_argument("--num_samples", default=20, type=int)
 parser.add_argument(
+    "--max_eval_batches",
+    default=0,
+    type=int,
+    help="仅用于可比性审计或快速协议检查。大于 0 时，评估最多运行这么多 batch。",
+)
+parser.add_argument(
+    "--eval_print_every",
+    default=0,
+    type=int,
+    help="评估进度打印间隔。大于 0 时，每处理若干个 batch 打印一次进度。",
+)
+parser.add_argument(
     "--device",
     default="cuda",
     choices=["cuda", "cpu"],
@@ -111,21 +125,6 @@ parser.add_argument(
     metavar="PATH",
     help="path to latest checkpoint (default: none)",
 )
-
-
-def evaluate_helper(error, seq_start_end):
-    """把多次采样误差按场景聚合。"""
-    sum_ = 0
-    error = torch.stack(error, dim=1)
-    for (start, end) in seq_start_end:
-        start = start.item()
-        end = end.item()
-        _error = error[start:end]
-        _error = torch.sum(_error, dim=0)
-        _error = torch.min(_error)
-        sum_ += _error
-    return sum_
-
 
 def get_generator(checkpoint):
     """从 checkpoint 恢复生成器。"""
@@ -166,21 +165,19 @@ def get_generator(checkpoint):
     model.to(args.device)
     model.eval()
     return model
-
-
-def cal_ade_fde(pred_traj_gt, pred_traj_fake):
-    """计算 ADE 和 FDE。"""
-    ade = displacement_error(pred_traj_fake, pred_traj_gt, mode="raw")
-    fde = final_displacement_error(pred_traj_fake[-1], pred_traj_gt[-1], mode="raw")
-    return ade, fde
-
-
 def evaluate(args, loader, generator):
     """在整个数据集上做 best-of-K 评估。"""
     ade_outer, fde_outer = [], []
     total_traj = 0
     with torch.no_grad():
-        for batch in loader:
+        for batch_idx, batch in enumerate(loader):
+            if args.max_eval_batches > 0 and batch_idx >= args.max_eval_batches:
+                print(
+                    "Reached max_eval_batches={}, stop evaluation early.".format(
+                        args.max_eval_batches
+                    )
+                )
+                break
             batch = [tensor.to(args.device) for tensor in batch]
             (
 
@@ -237,17 +234,34 @@ def evaluate(args, loader, generator):
                 pred_traj_fake_rel = pred_traj_fake_rel[-args.pred_len :]
 
                 pred_traj_fake = relative_to_abs(pred_traj_fake_rel, obs_traj[-1,:,2:4])
-                ade_, fde_ = cal_ade_fde(pred_traj_gt[:,:,2:4], pred_traj_fake)
+                ade_, fde_ = compute_raw_displacement_metrics(
+                    pred_traj_gt[:, :, 2:4],
+                    pred_traj_fake,
+                )
                 ade.append(ade_)
                 fde.append(fde_)
-            ade_sum = evaluate_helper(ade, seq_start_end)
-            fde_sum = evaluate_helper(fde, seq_start_end)
+            ade_sum, fde_sum = compute_best_of_k_metric_sums(
+                ade,
+                fde,
+                seq_start_end,
+            )
 
             ade_outer.append(ade_sum)
             fde_outer.append(fde_sum)
+            if args.eval_print_every > 0 and batch_idx % args.eval_print_every == 0:
+                print(
+                    "Eval batch {}/? | total_traj={} | current_ade_sum={:.6f} current_fde_sum={:.6f}".format(
+                        batch_idx,
+                        total_traj,
+                        ade_sum.item(),
+                        fde_sum.item(),
+                    )
+                )
 
+        if total_traj == 0:
+            raise RuntimeError("评估未处理任何轨迹，请检查数据集或 max_eval_batches 设置。")
         ade = sum(ade_outer) / (total_traj * args.pred_len)
-        fde = sum(fde_outer) / (total_traj)
+        fde = sum(fde_outer) / total_traj
         return ade, fde
 
 

@@ -3,6 +3,8 @@ import pathlib
 import sys
 import types
 import unittest
+from unittest import mock
+from types import SimpleNamespace
 
 import torch
 
@@ -24,6 +26,7 @@ def load_module(module_name, relative_path):
 
 models = load_module("d2tp_models", "D2TP/models.py")
 train = load_module("d2tp_train", "D2TP/train.py")
+evaluate_model = load_module("d2tp_evaluate_model", "D2TP/evaluate_model.py")
 
 
 class CycleStateProtocolTest(unittest.TestCase):
@@ -164,6 +167,67 @@ class CycleStateProtocolTest(unittest.TestCase):
         lane_anchor_rollout = self.model.debug_last_aux["lane_queue_rollout_anchor_seq"]
         self.assertTrue(torch.allclose(lane_anchor_rollout[0, 0], lane_anchor_rollout[0, 1]))
         self.assertFalse(torch.allclose(lane_anchor_rollout[0, 0], lane_anchor_rollout[0, 2]))
+
+    def test_queue_rollout_uses_previous_step_state(self):
+        traffic_context = self.model.build_traffic_context(
+            self.obs_traj_rel,
+            self.obs_traj,
+            self.obs_state,
+            self.pred_state,
+            self.seq_start_end,
+        )
+        recorded_inputs = []
+        original_rollout = self.model.rollout_queue_features
+
+        def capture_rollout(prev_queue_feature, current_cycle_feature, last_pred_offset, step_index):
+            recorded_inputs.append(prev_queue_feature.detach().clone())
+            return original_rollout(
+                prev_queue_feature,
+                current_cycle_feature,
+                last_pred_offset,
+                step_index,
+            )
+
+        with mock.patch.object(
+            self.model,
+            "rollout_queue_features",
+            side_effect=capture_rollout,
+        ):
+            self.model(
+                self.obs_traj_rel,
+                self.obs_traj,
+                self.obs_state,
+                self.pred_state,
+                self.seq_start_end,
+                traffic_context=traffic_context,
+            )
+
+        self.assertEqual(self.model.pred_len, len(recorded_inputs))
+        base_queue_feature = traffic_context["meso"]["queue_feature_seq"][-1]
+        self.assertTrue(torch.allclose(recorded_inputs[0], base_queue_feature))
+        self.assertFalse(torch.allclose(recorded_inputs[1], base_queue_feature))
+        self.assertFalse(torch.allclose(recorded_inputs[1], recorded_inputs[0]))
+
+    def test_lane_anchor_rollout_is_dynamic_after_first_step(self):
+        traffic_context = self.model.build_traffic_context(
+            self.obs_traj_rel,
+            self.obs_traj,
+            self.obs_state,
+            self.pred_state,
+            self.seq_start_end,
+        )
+        self.model(
+            self.obs_traj_rel,
+            self.obs_traj,
+            self.obs_state,
+            self.pred_state,
+            self.seq_start_end,
+            traffic_context=traffic_context,
+        )
+        lane_anchor_rollout = self.model.debug_last_aux["lane_queue_rollout_anchor_seq"]
+        observed_anchor = traffic_context["meso"]["lane_queue_anchor_seq"][-1]
+        self.assertTrue(torch.allclose(lane_anchor_rollout[0], observed_anchor))
+        self.assertFalse(torch.allclose(lane_anchor_rollout[1], observed_anchor))
 
     def test_cycle_forward_supports_disabled_queue_rollout(self):
         no_rollout_model = models.CycleStateTrajectoryGenerator(
@@ -421,6 +485,144 @@ class CycleStateProtocolTest(unittest.TestCase):
             self.model, baseline_model.state_dict()
         )
         self.assertEqual([], skipped)
+
+    def test_evaluate_helper_matches_scene_level_best_of_k_aggregation(self):
+        seq_start_end = torch.tensor([[0, 2]], dtype=torch.long)
+        ade_raw = torch.tensor([3.0, 9.0], dtype=torch.float32)
+        fde_raw = torch.tensor([1.0, 5.0], dtype=torch.float32)
+
+        ade_sum = train.evaluate_helper([ade_raw], seq_start_end)
+        fde_sum = train.evaluate_helper([fde_raw], seq_start_end)
+
+        self.assertEqual(12.0, ade_sum.item())
+        self.assertEqual(6.0, fde_sum.item())
+
+    def test_compute_average_displacement_metrics_matches_manual_average(self):
+        pred_traj_gt = torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 2.0]],
+                [[2.0, 0.0], [0.0, 4.0]],
+            ],
+            dtype=torch.float32,
+        )
+        pred_traj_fake = torch.tensor(
+            [
+                [[0.0, 0.0], [0.0, 1.0]],
+                [[1.0, 0.0], [0.0, 3.0]],
+            ],
+            dtype=torch.float32,
+        )
+        ade, fde = train.compute_average_displacement_metrics(
+            pred_traj_gt, pred_traj_fake
+        )
+        self.assertAlmostEqual(1.0, ade.item(), places=6)
+        self.assertAlmostEqual(1.0, fde.item(), places=6)
+
+    def test_compute_best_of_k_metrics_chooses_lowest_scene_error(self):
+        seq_start_end = torch.tensor([[0, 2]], dtype=torch.long)
+        ade_candidates = [
+            torch.tensor([3.0, 9.0], dtype=torch.float32),
+            torch.tensor([1.0, 1.0], dtype=torch.float32),
+        ]
+        fde_candidates = [
+            torch.tensor([4.0, 6.0], dtype=torch.float32),
+            torch.tensor([1.0, 2.0], dtype=torch.float32),
+        ]
+        ade, fde = train.compute_best_of_k_metrics(
+            ade_candidates,
+            fde_candidates,
+            seq_start_end,
+            pred_len=12,
+            total_traj=2,
+        )
+        self.assertAlmostEqual((1.0 + 1.0) / (2.0 * 12.0), ade.item(), places=6)
+        self.assertAlmostEqual((1.0 + 2.0) / 2.0, fde.item(), places=6)
+
+    def test_should_run_validation_uses_epoch_boundary_for_formal_training(self):
+        args = types.SimpleNamespace(
+            start_epoch=0,
+            val_every=1,
+            max_train_batches=0,
+            num_epochs=10,
+            print_every=1,
+        )
+        self.assertFalse(train.should_run_validation(args, epoch=0, batch_idx=0, num_batches=5))
+        self.assertTrue(train.should_run_validation(args, epoch=0, batch_idx=4, num_batches=5))
+
+    def test_should_run_validation_keeps_batch_level_feedback_for_smoke_runs(self):
+        args = types.SimpleNamespace(
+            start_epoch=0,
+            val_every=1,
+            max_train_batches=1,
+            num_epochs=0,
+            print_every=2,
+        )
+        self.assertFalse(train.should_run_validation(args, epoch=0, batch_idx=0, num_batches=5))
+        self.assertTrue(train.should_run_validation(args, epoch=0, batch_idx=1, num_batches=5))
+        self.assertFalse(train.should_run_validation(args, epoch=0, batch_idx=2, num_batches=5))
+        self.assertTrue(train.should_run_validation(args, epoch=0, batch_idx=4, num_batches=5))
+
+    def test_should_run_validation_still_triggers_on_last_smoke_batch(self):
+        args = types.SimpleNamespace(
+            start_epoch=0,
+            val_every=1,
+            max_train_batches=3,
+            num_epochs=0,
+            print_every=20,
+        )
+        self.assertTrue(train.should_run_validation(args, epoch=0, batch_idx=2, num_batches=3))
+
+    def test_apply_stage_defaults_preserves_explicit_num_val_samples(self):
+        args = types.SimpleNamespace(
+            train_stage="warmup",
+            model_type="cyclestate",
+            generator_only=None,
+            gan_weight=None,
+            aux_queue_weight=None,
+            aux_cycle_weight=None,
+            num_val_samples=5,
+        )
+        train.apply_stage_defaults(args)
+        self.assertEqual(5, args.num_val_samples)
+
+    def test_evaluate_model_supports_max_eval_batches_and_weighted_averaging(self):
+        batch = [
+            torch.zeros(8, 2, 10),
+            torch.zeros(12, 2, 10),
+            torch.zeros(8, 2, 9),
+            torch.zeros(12, 2, 9),
+            torch.zeros(8, 2, 4),
+            torch.zeros(12, 2, 4),
+            torch.zeros(2),
+            torch.zeros(2, 20),
+            torch.tensor([[0, 2]], dtype=torch.long),
+        ]
+        generator = mock.Mock()
+        generator.return_value = torch.zeros(12, 2, 2)
+        args = SimpleNamespace(
+            device="cpu",
+            model_type="d2tpred",
+            num_samples=1,
+            pred_len=12,
+            max_eval_batches=1,
+            eval_print_every=1,
+        )
+        with mock.patch.object(
+            evaluate_model,
+            "compute_raw_displacement_metrics",
+            return_value=(
+                torch.tensor([1.0, 3.0], dtype=torch.float32),
+                torch.tensor([2.0, 4.0], dtype=torch.float32),
+            ),
+        ) as raw_metrics, mock.patch.object(
+            evaluate_model,
+            "relative_to_abs",
+            return_value=torch.zeros(12, 2, 2),
+        ):
+            ade, fde = evaluate_model.evaluate(args, [batch, batch], generator)
+        self.assertAlmostEqual((1.0 + 3.0) / (2.0 * 12.0), ade.item(), places=6)
+        self.assertAlmostEqual((2.0 + 4.0) / 2.0, fde.item(), places=6)
+        self.assertEqual(1, raw_metrics.call_count)
 
 
 if __name__ == "__main__":

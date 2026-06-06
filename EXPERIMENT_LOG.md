@@ -9,6 +9,24 @@
   但后续更推荐统一使用 `experiments/`，
   这样日志、checkpoint 和协议设置都能按实验分组保存。
 
+## 结果标签规范
+- `smoke`
+  - 只用于验证 forward/backward、日志、checkpoint、消融开关和损失项是否工作。
+  - 典型特征：`max_train_batches=1`、`max_val_batches=1`、`num_epochs=0`。
+- `protocol-check`
+  - 用于验证训练协议、checkpoint 恢复、评估脚本和统计口径是否一致。
+- `comparable`
+  - 只有在 split、checkpoint 来源、ADE/FDE 聚合方式、采样次数和评估脚本口径
+    都对齐后，才允许打这个标签。
+
+## 当前口径审计状态
+- `train.py` 与 `evaluate_model.py` 现在已经共用底层 raw/average displacement 计算函数。
+- 新增 `--val_every`，用来区分：
+  - 正式训练：按 epoch 间隔验证
+  - smoke/protocol-check：按极小 batch 快速验证
+- 当前日志里的大多数历史结果仍属于 `smoke`，
+  不能直接与论文表格或正式 baseline 结论等价。
+
 ## 配置模板
 - Experiment name：
 - Date：
@@ -103,6 +121,7 @@
 ## 本轮已完成的 Smoke Runs
 ### Run
 - Name：`experiments/cyclestate/warmup_gating_aux_v1`
+- Tag：`smoke`
 - Command：
   `python D2TP/train.py --log_dir experiments/cyclestate/warmup_gating_aux_v1 --model_type cyclestate --train_stage warmup --device cuda --pin_memory --loader_num_workers 0 --batch_size 16 --best_k 2 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 1 --max_train_batches 1 --max_val_batches 1`
 - Best ADE：`155.554`
@@ -114,6 +133,7 @@
 
 ### Run
 - Name：`experiments/cyclestate/warmup_nogating_aux_v1`
+- Tag：`smoke`
 - Command：
   `python D2TP/train.py --log_dir experiments/cyclestate/warmup_nogating_aux_v1 --model_type cyclestate --train_stage warmup --disable_state_gating --device cuda --pin_memory --loader_num_workers 0 --batch_size 16 --best_k 2 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 1 --max_train_batches 1 --max_val_batches 1`
 - Best ADE：`155.569`
@@ -124,6 +144,7 @@
 
 ### Run
 - Name：`experiments/cyclestate/warmup_gating_noaux_v1`
+- Tag：`smoke`
 - Command：
   `python D2TP/train.py --log_dir experiments/cyclestate/warmup_gating_noaux_v1 --model_type cyclestate --train_stage warmup --aux_queue_weight 0 --aux_cycle_weight 0 --device cuda --pin_memory --loader_num_workers 0 --batch_size 16 --best_k 2 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 1 --max_train_batches 1 --max_val_batches 1`
 - Best ADE：`155.555`
@@ -135,6 +156,7 @@
 
 ### Run
 - Name：`experiments/d2tpred/baseline_quick_v3`
+- Tag：`smoke`
 - Command：
   `python D2TP/train.py --log_dir experiments/d2tpred/baseline_quick_v3 --model_type d2tpred --device cuda --pin_memory --loader_num_workers 0 --batch_size 16 --best_k 2 --resume D2TP/model_best.pth.tar --num_epochs 129 --print_every 1 --max_train_batches 3 --max_val_batches 1`
 - Best ADE：`84.391`
@@ -173,6 +195,7 @@
 ## Smoke Run：Queue Rollout Enabled
 ### Run
 - Name：`experiments/cyclestate/warmup_rollout_aux_v1`
+- Tag：`smoke`
 - Command：
   `python D2TP/train.py --log_dir experiments/cyclestate/warmup_rollout_aux_v1 --model_type cyclestate --train_stage warmup --device cuda --pin_memory --loader_num_workers 0 --batch_size 16 --best_k 2 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 1 --max_train_batches 1 --max_val_batches 1`
 - Best ADE：`156.592`
@@ -198,6 +221,7 @@
 ## Smoke Run：Queue Rollout On/Off 消融
 ### Run
 - Name：`experiments/cyclestate/warmup_rollout_on_v1`
+- Tag：`smoke`
 - Command：
   `python D2TP/train.py --log_dir experiments/cyclestate/warmup_rollout_on_v1 --model_type cyclestate --train_stage warmup --device cuda --pin_memory --loader_num_workers 0 --batch_size 16 --best_k 2 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 1 --max_train_batches 1 --max_val_batches 1`
 - Best ADE：`156.592`
@@ -209,6 +233,7 @@
 
 ### Run
 - Name：`experiments/cyclestate/warmup_rollout_off_v1`
+- Tag：`smoke`
 - Command：
   `python D2TP/train.py --log_dir experiments/cyclestate/warmup_rollout_off_v1 --model_type cyclestate --train_stage warmup --disable_queue_rollout --device cuda --pin_memory --loader_num_workers 0 --batch_size 16 --best_k 2 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 1 --max_train_batches 1 --max_val_batches 1`
 - Best ADE：`156.663`
@@ -238,6 +263,7 @@
 ## Smoke Run：Lane Anchor Enabled
 ### Run
 - Name：`experiments/cyclestate/warmup_lane_anchor_v1`
+- Tag：`smoke`
 - Command：
   `python D2TP/train.py --log_dir experiments/cyclestate/warmup_lane_anchor_v1 --model_type cyclestate --train_stage warmup --device cuda --pin_memory --loader_num_workers 0 --batch_size 16 --best_k 2 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 1 --max_train_batches 1 --max_val_batches 1`
 - Best ADE：`156.591`
@@ -275,6 +301,7 @@
 ## Smoke Run：Decoder Residual On/Off
 ### Run
 - Name：`experiments/cyclestate/warmup_residual_on_v1`
+- Tag：`smoke`
 - Command：
   `python D2TP/train.py --log_dir experiments/cyclestate/warmup_residual_on_v1 --model_type cyclestate --train_stage warmup --device cuda --pin_memory --loader_num_workers 0 --batch_size 16 --best_k 2 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 1 --max_train_batches 1 --max_val_batches 1`
 - Best ADE：`54.784`
@@ -286,6 +313,7 @@
 
 ### Run
 - Name：`experiments/cyclestate/warmup_residual_off_v1`
+- Tag：`smoke`
 - Command：
   `python D2TP/train.py --log_dir experiments/cyclestate/warmup_residual_off_v1 --model_type cyclestate --train_stage warmup --disable_decoder_state_residual --device cuda --pin_memory --loader_num_workers 0 --batch_size 16 --best_k 2 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 1 --max_train_batches 1 --max_val_batches 1`
 - Best ADE：`45.856`
@@ -306,3 +334,179 @@
   - residual pathway 在科学上是有意义的，应该继续保留为可控变量
   - 但当前这次 1-batch 结果仍不能证明 `residual on` 一定优于 `residual off`
   - 下一步正确做法仍然是在相同协议下做更长的 `warmup/refine` 比较
+
+## 本轮实现更新：动态 rollout / 动态 lane anchor / 评测口径收口
+- 状态：
+  - `protocol-check`
+- 已完成实现：
+  - `queue rollout` 改为真正递推，每一步使用上一步 rolled meso-state
+  - `lane-consensus anchor` 改为预测期动态重聚合
+  - 新增调试信号：
+    - `queue_rollout_feature_seq`
+    - `decoder_state_init_residual_norm`
+    - `decoder_state_step_residual_norm_seq`
+  - 训练内 `validate` 与独立评估脚本现在共用同一套 raw/average displacement 计算函数
+  - 新增 `--val_every`，显式区分正式训练验证与 smoke 验证
+- 已完成验证：
+  - `python tests/test_cyclestate_protocol.py`
+  - `python -m unittest discover -s tests -p 'test_cyclestate_protocol.py'`
+  - `python -m py_compile D2TP/models.py D2TP/train.py D2TP/evaluate_model.py tests/test_cyclestate_protocol.py`
+- 当前意义：
+  - 这一步主要是让实现与科研叙事、训练验证与独立评估重新对齐。
+  - 它仍然不是新的 `comparable` 性能结论。
+
+### Run
+- Name：`experiments/cyclestate/warmup_dynamic_protocol_v1`
+- Tag：`protocol-check`
+- Command：
+  `python D2TP/train.py --log_dir experiments/cyclestate/warmup_dynamic_protocol_v1 --model_type cyclestate --train_stage warmup --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --best_k 2 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 1 --max_train_batches 1 --max_val_batches 1 --val_every 1`
+- Best ADE：`59.663`
+- Best FDE：`126.717`
+- Stability notes：
+  - warm-start 正常，日志显示 `skipped 0 keys`
+  - 单 batch 训练和验证均正常完成
+  - 新路径上的 rollout losses 正常激活：
+    - `QRollReg 0.358161`
+    - `QRollCls 0.704186`
+  - 该结果属于 `protocol-check`，不能直接与论文或正式 baseline 表格比较
+
+### Run
+- Name：`experiments/cyclestate/warmup_bestofk_protocol_v1`
+- Tag：`protocol-check`
+- Command：
+  `python D2TP/train.py --log_dir experiments/cyclestate/warmup_bestofk_protocol_v1 --model_type cyclestate --train_stage warmup --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --best_k 2 --num_val_samples 4 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 1 --max_train_batches 1 --max_val_batches 1 --val_every 1`
+- Best ADE：`52.322`
+- Best FDE：`109.916`
+- Stability notes：
+  - warm-start 正常，日志显示 `skipped 0 keys`
+  - 训练内验证已经切到多采样 best-of-K 口径（`num_val_samples=4`）
+  - 与上一条单采样 `protocol-check` 相比，验证指标进一步下降：
+    - 单采样验证：`59.663 / 126.717`
+    - 多采样验证：`52.322 / 109.916`
+  - 这说明“训练内验证是否采用多采样 best-of-K”会真实影响 checkpoint 选择
+  - 该结果仍属于 `protocol-check`，不应直接拿去和论文表格比较
+
+## 下一轮正式实验矩阵
+1. `baseline_audit_v1`
+   - 标签目标：`protocol-check -> comparable`
+   - 作用：统一口径复核 `D2TP/model_best.pth.tar`
+2. `cyclestate_warmup_main_v2`
+   - 标签目标：`protocol-check`
+   - 配置：`residual on + rollout on + lane anchor on + gating on`
+3. `cyclestate_refine_main_v2`
+   - 标签目标：`protocol-check`
+   - 配置：从最佳 warmup checkpoint 续训
+4. `cyclestate_refine_no_rollout_v2`
+   - 标签目标：`protocol-check`
+   - 配置：主配置仅关闭 rollout
+5. `cyclestate_refine_no_anchor_v2`
+   - 标签目标：`protocol-check`
+   - 配置：主配置仅关闭 lane anchor
+
+## Baseline Audit：统一口径可控复核（进行中）
+### Run
+- Name：`baseline_audit_v1_val_partial`
+- Tag：`protocol-check`
+- Command：
+  `python D2TP/evaluate_model.py --model_type d2tpred --device cuda --loader_num_workers 0 --batch_size 16 --num_samples 4 --max_eval_batches 5 --eval_print_every 1 --resume D2TP/model_best.pth.tar --dset_type val`
+- ADE：`40.673`
+- FDE：`79.941`
+- Notes：
+  - 这是统一口径、可控批次数的 baseline audit 部分结果，不是完整 `val` split 最终结论。
+  - 主要意义是确认：
+    - `evaluate_model.py` 现在支持进度输出
+    - 支持 `max_eval_batches`
+    - scene-level best-of-K 聚合与总轨迹归一化逻辑已生效
+
+### Run
+- Name：`baseline_audit_v1_val_full_num_samples4`
+- Tag：`comparable`
+- Command：
+  `python D2TP/evaluate_model.py --model_type d2tpred --device cuda --loader_num_workers 0 --batch_size 16 --num_samples 4 --eval_print_every 10 --resume D2TP/model_best.pth.tar --dset_type val`
+- ADE：`38.493`
+- FDE：`78.706`
+- Notes：
+  - 这是目前仓库内最完整的 `val` split baseline 统一口径复核结果。
+  - 该结果与 `baseline_audit_v1_val_partial` 一致地表明：
+    baseline audit 管线已经可以用于正式 split 复核。
+
+### Run
+- Name：`baseline_audit_v1_test_full_num_samples4`
+- Tag：`comparable`
+- Command：
+  `python D2TP/evaluate_model.py --model_type d2tpred --device cuda --loader_num_workers 0 --batch_size 16 --num_samples 4 --eval_print_every 10 --resume D2TP/model_best.pth.tar --dset_type test`
+- ADE：`17.812`
+- FDE：`37.568`
+- Notes：
+  - 这是目前仓库内最完整的 `test` split baseline 统一口径复核结果。
+  - 与完整 `val` 结果的明显落差提示：
+    后续所有“超过 baseline”的说法必须明确 split 和采样口径，
+    不能再把 `val/test` 混写。
+  - `num_samples=20` 的更接近论文口径审计已启动过一次，
+    但本轮未跑完全量，因此暂不记作正式结果。
+
+## Warmup Main v2：短正式原型（进行中）
+### Run
+- Name：`experiments/cyclestate/warmup_main_v2_proto`
+- Tag：`protocol-check`
+- Command：
+  `python D2TP/train.py --log_dir experiments/cyclestate/warmup_main_v2_proto --model_type cyclestate --train_stage warmup --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --best_k 4 --num_val_samples 4 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 5 --max_train_batches 20 --max_val_batches 5 --val_every 1`
+- Best ADE：`60.857`
+- Best FDE：`118.979`
+- Stability notes：
+  - 完整 warm-start 正常：`skipped 0 keys`
+  - 训练内验证已使用多采样 best-of-K 口径：`num_val_samples=4`
+  - 在短原型设置下，验证指标出现了明确下降轨迹：
+    - 第一次验证：`103.942 / 206.707`
+    - 中间最低：`92.723 / 189.754`
+    - 当前最佳：`60.857 / 118.979`
+  - queue/cycle 结构化辅助项与 rollout losses 同步下降，
+    说明当前主配置不仅能跑通，而且已经开始出现更像正式训练的优化信号
+
+### Run
+- Name：`experiments/cyclestate/warmup_main_v2`
+- Tag：`protocol-check`
+- Command：
+  `python D2TP/train.py --log_dir experiments/cyclestate/warmup_main_v2 --model_type cyclestate --train_stage warmup --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --best_k 4 --num_val_samples 4 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 20 --max_train_batches 100 --max_val_batches 20 --val_every 1`
+- Best ADE：`56.827`
+- Best FDE：`107.416`
+- Stability notes：
+  - 该 run 使用的是修复前的 `should_run_validation()` 逻辑，
+    会在 `batch 0` 之后立刻做一次 20-batch 验证。
+  - 因此它更适合证明“主配置确实在继续学习”，
+    不适合当作最干净的 schedule 对照实验。
+  - 关键信号：
+    - 第一个验证点：`99.934 / 195.568`
+    - 第二个验证点：`56.827 / 107.416`
+  - 训练 batch 20 时，日志中的生成器重建项已经降到：
+    - `L2_Loss 56.534`
+    - `QRollReg 0.015945`
+    - `QRollCls 0.417931`
+
+## Stage 21：验证调度修复后的 Rollout 短对照
+### Run
+- Name：`experiments/cyclestate/warmup_main_v2_schedfix`
+- Tag：`protocol-check`
+- Command：
+  `python D2TP/train.py --log_dir experiments/cyclestate/warmup_main_v2_schedfix --model_type cyclestate --train_stage warmup --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --best_k 4 --num_val_samples 4 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 20 --max_train_batches 20 --max_val_batches 20 --val_every 1`
+- Best ADE：`78.227`
+- Best FDE：`152.544`
+- Notes：
+  - 使用修复后的验证规则：
+    `smoke / protocol-check` 模式不再在 `batch 0` 后立刻验证，
+    而是在 `print_every` 区间末尾或最后一个 batch 验证。
+  - 该结果代表“rollout on”的当前短协议基线。
+
+### Run
+- Name：`experiments/cyclestate/warmup_no_rollout_v2_schedfix`
+- Tag：`protocol-check`
+- Command：
+  `python D2TP/train.py --log_dir experiments/cyclestate/warmup_no_rollout_v2_schedfix --model_type cyclestate --train_stage warmup --disable_queue_rollout --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --best_k 4 --num_val_samples 4 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 20 --max_train_batches 20 --max_val_batches 20 --val_every 1`
+- Best ADE：`71.863`
+- Best FDE：`140.974`
+- Notes：
+  - 这是与主配置完全匹配、仅关闭 rollout 的短协议对照。
+  - 当前 `no_rollout` 反而优于 `rollout on`，
+    说明真正递推的 meso-state memory 还没有被当前 warmup 配方训顺。
+  - 下一步应优先修正 rollout 注入与监督策略，
+    而不是直接推进 `refine` 或重新引入 GAN。

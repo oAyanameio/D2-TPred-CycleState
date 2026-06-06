@@ -5,6 +5,11 @@
 1. 原始 `D2-TPred` 基线代码的可复现实验仓库。
 2. 新研究方向 `CycleState` 的持续开发仓库。
 
+## 当前开发约束
+- 当前只保留 `main` 作为持续开发主线，不再维护长期实验分支。
+- `origin/main` 是默认推送目标；`upstream/main` 仅用于对照原始 baseline/论文。
+- 核心说明文档默认使用中文，代码字段、参数名和论文术语保留必要英文原文。
+
 当前主线不是简单给原模型“再加一个时序模块”，而是围绕下面这条科研叙事展开：
 
 `信号灯路口轨迹预测，本质上可以被建模为全周期交通状态记忆（full-cycle traffic-state memory）问题。`
@@ -41,6 +46,49 @@
    - 使用 structured auxiliary losses，分别监督 queue/cycle 的不同语义变量。
    - 当前最新版本使用 `baseline-compatible decoder warm-start`，避免新结构破坏原始 D2-TPred 解码器的已学习能力。
 
+# 评测可比性说明
+当前仓库里的实验结果需要分成三类看：
+1. `smoke`
+   - 目标是验证 forward/backward、日志、checkpoint、消融开关和损失项是否正常工作。
+   - 常见特征是 `max_train_batches=1`、`max_val_batches=1` 或 `num_epochs=0`。
+   - 这类结果不能直接用于宣称“超过 baseline”或“超过论文指标”。
+2. `protocol-check`
+   - 目标是验证训练协议、验证触发频率、采样逻辑、checkpoint 恢复与评估脚本是否彼此一致。
+   - 可以用于排查“为什么训练内验证和独立评估看起来不一致”，
+     但仍不应直接当成论文结论。
+3. `comparable`
+   - 只有在数据 split、checkpoint 来源、ADE/FDE 统计方式、采样次数和评估脚本口径
+     都明确对齐后，结果才可用于和 baseline 或论文表格做正式比较。
+
+当前主线先做的是：
+- 先把 `train.py` 的验证逻辑与 `evaluate_model.py` 的误差聚合口径对齐；
+- 再用统一口径复核 baseline checkpoint；
+- 最后再启动长程 `warmup/refine` 正式实验。
+
+当前已经拿到四条更有参考价值的中间证据：
+- `baseline_audit_v1_val_full_num_samples4`
+  - 在统一口径、`num_samples=4` 的完整 `val` split 复核中，
+    原始 baseline checkpoint 得到 `ADE 38.493 / FDE 78.706`
+  - 这条结果已经可以作为仓库内 `4-sample` 口径下的 `comparable` 参考线。
+- `baseline_audit_v1_test_full_num_samples4`
+  - 在统一口径、`num_samples=4` 的完整 `test` split 复核中，
+    原始 baseline checkpoint 得到 `ADE 17.812 / FDE 37.568`
+  - 这说明仓库内 baseline checkpoint 在 `test` split 上仍然很强，
+    当前 `CycleState` 距离真正“超过 baseline”还有明显差距。
+- `experiments/cyclestate/warmup_main_v2`
+  - 在旧的 `protocol-check` 验证调度下，
+    主配置 `CycleState` 第二个验证点下降到 `ADE 56.827 / FDE 107.416`
+  - 但该 run 会在 `batch 0` 之后立刻做一次 20-batch 验证，
+    因此只能作为“模型在学”的证据，不能当成最干净的短对照。
+- `experiments/cyclestate/warmup_main_v2_schedfix` vs
+  `experiments/cyclestate/warmup_no_rollout_v2_schedfix`
+  - 在修正后的同口径短协议下，
+    主配置得到 `78.227 / 152.544`，
+    `no_rollout` 对照得到 `71.863 / 140.974`
+  - 这说明“真正递推的 queue rollout”在当前短程 warmup 设置下
+    还没有兑现预期收益，
+    下一步必须先修 rollout 路径本身，而不是急着进入 refine/GAN。
+
 # 当前状态总结
 ## 已完成
 - 已完成 `CycleStateTrajectoryGenerator` 的原型实现。
@@ -54,10 +102,12 @@
 
 ## 当前还没完成
 - 还没有做足够长的 `warmup/refine` 正式训练，当前大部分结论仍然来自短 smoke run。
+- 还没有在统一口径下证明 `rollout on` 稳定优于 `no_rollout`。
 - 还没有证明 `decoder residual` 在更长训练下稳定带来收益。
 - 还没有完成辅助状态预测质量的系统评估与可视化。
 - 还没有完成 INT2 数据接口的正式接入。
 - 还没有拿到“稳定超过 baseline/论文结果”的正式实验结论。
+- 还没有完成更接近论文口径的 `num_samples=20` baseline 全量审计。
 - 还没有形成最终论文需要的完整消融、误差分析和可视化证据链。
 
 ## 接下来要做的任务
@@ -446,6 +496,70 @@
 - 这也确认了：
   “保护 baseline decoder 能力”已经成为下一阶段研究中的首要优化轴之一。
 
+## Stage 20: 动态 Queue Rollout / Dynamic Lane Anchor / 评测口径收口
+- 原因：
+  - 之前的 `queue rollout` 虽然已经进入训练流程，但每一步仍主要从最后观测帧
+    的静态 `base_queue_feature` 近似展开。
+  - `lane-consensus anchor` 也主要复用最后观测帧 anchor，
+    这和“预测期内中观状态持续演化”的故事并不完全一致。
+  - 同时，训练内验证与独立评估脚本虽然方向一致，但底层误差聚合函数没有完全共用，
+    不利于做严格的可比性审计。
+- 改动：
+  - `queue rollout` 现在改成真正递推：
+    每一步使用上一步 rolled meso-state，而不是反复从静态末帧展开。
+  - `lane-consensus anchor` 现在改成预测期动态重聚合，
+    而不是始终复用最后观测帧的共享 anchor。
+  - 新增统一的 raw/average displacement 计算函数，
+    让 `train.py` 的 `validate` 与 `evaluate_model.py` 共用同一套误差定义。
+  - 新增 `val_every`，把“正式训练按 epoch 验证”和“smoke run 按极小 batch 快速验证”分开。
+  - 新增调试信号：
+    - `queue_rollout_feature_seq`
+    - `decoder_state_init_residual_norm`
+    - `decoder_state_step_residual_norm_seq`
+- 对科研叙事的贡献：
+  - 这一步把“full-cycle traffic-state memory”的故事从
+    “我们有这个想法”推进成
+    “我们真的在预测期里递推中观状态，而且能跟踪它如何调制 decoder”。
+- 当前结论：
+  - 这一步主要是让方法实现和科研叙事重新对齐，
+    不是新的性能结论。
+  - 接下来真正需要看的，是统一口径下更长的 `warmup/refine` 结果。
+  - 当前已经用一次 `protocol-check` 级短实验验证：
+    `experiments/cyclestate/warmup_dynamic_protocol_v1`
+    在 `skipped 0 keys` 的完整 warm-start 下成功跑通，
+    得到 `ADE 59.663 / FDE 126.717`，并且新的 rollout losses 正常激活。
+  - 随后又补了一次“训练内验证也走多采样 best-of-K”的 `protocol-check`：
+    `experiments/cyclestate/warmup_bestofk_protocol_v1`
+    在 `num_val_samples=4` 下得到 `ADE 52.322 / FDE 109.916`。
+  - 这说明训练内验证的采样口径会真实影响数值和 checkpoint 选择，
+    因此后续正式实验必须把这一点固定下来，再谈是否“超过 baseline”。
+
+## Stage 21: 验证调度修复与 Rollout Sanity Check
+- 原因：
+  - 旧的 `should_run_validation()` 在 `smoke / protocol-check` 模式下，
+    会在 `batch 0` 之后立刻触发验证。
+  - 当 `max_val_batches` 已经放大到 20 这种“中等预算短实验”时，
+    这种早期大验证既耗时，也会把极早期噪声混进 checkpoint 选择。
+- 改动：
+  - `smoke / protocol-check` 现在改为：
+    按 `print_every` 的区间末尾触发验证，
+    并保证最后一个 batch 一定触发验证。
+  - 已为该行为补充并通过 `unittest` 回归测试。
+- 新证据：
+  - 原始 `D2TP/model_best.pth.tar` 在统一 `4-sample` 口径下，
+    完整 `val` 为 `38.493 / 78.706`，
+    完整 `test` 为 `17.812 / 37.568`。
+  - 修正验证调度后做 20-train-batch / 20-val-batch 的匹配短对照：
+    - `warmup_main_v2_schedfix`：`78.227 / 152.544`
+    - `warmup_no_rollout_v2_schedfix`：`71.863 / 140.974`
+- 当前解释：
+  - `CycleState` 主线并不是“完全训不动”，
+    因为旧 run 的第二个验证点确实降到了 `56.827 / 107.416`；
+  - 但在更干净的短协议对照里，
+    `rollout on` 目前还不如 `no_rollout`，
+    所以当前最需要优化的不是叠新模块，
+    而是把 rollout 的训练入口、监督强度和状态注入方式调顺。
+
 ### 新训练协议下的首批 Smoke 观察
 - `cyclestate + warmup + aux + gating`：
   - ADE `155.554`，FDE `298.113`
@@ -471,6 +585,10 @@
 3. 从原始 `model_best.pth.tar` 进行 warm-start
 4. 开启 `--aux_queue_weight` 和 `--aux_cycle_weight`
 5. 在 queue/cycle 分支稳定前，不启用 GAN
+6. 正式长程实验显式设置 `--val_every 1` 或更大的 epoch 间隔；
+   `smoke` 才继续依赖极小 `max_train_batches/max_val_batches`
+7. 在 `smoke / protocol-check` 模式下，
+   现在默认按 `print_every` 的区间末尾做验证，不再在 `batch 0` 立刻触发大验证
 
 示例：
 ```bash
@@ -485,15 +603,21 @@ CUDA_VISIBLE_DEVICES=2 python D2TP/train.py \
 
 # 下一步计划优化
 当前 `CycleState` 分支仍然是一个早期原型。下一步的主要优化方向包括：
-1. 围绕 `decoder residual on/off` 跑更长的 `warmup / refine` 实验。
-2. 增加评估阶段的辅助状态预测质量分析。
-3. 完成多因素消融，包括：
-   - decoder residual
-   - queue rollout
-   - lane anchor
-   - state gating
-4. 在 `warmup/refine` 被证明稳定后，以更小的 GAN 权重重新引入 adversarial 训练。
-5. 在不破坏当前主模型路径的前提下，把现有 context adapter 扩展到后续 INT2 迁移。
+1. 以当前 `4-sample` baseline 全量结果为仓库内可比参考线，
+   再继续补更接近论文口径的 `num_samples=20` 审计。
+2. 先修 rollout 主线，再谈 refine：
+   - 优先检查 rollout state injection 是否过强
+   - 优先检查 rollout auxiliary supervision 是否过早主导优化
+3. 在 rollout 重新稳定后，再做匹配短对照：
+   - `queue rollout on/off`
+   - `lane anchor on/off`
+   - `state gating on/off`
+   - `decoder residual on/off`
+4. 只有当 `rollout on` 先在短协议下重新超过 `no_rollout`，
+   才值得进入更长的 `warmup/refine`。
+5. 增加评估阶段的辅助状态预测质量分析与可视化。
+6. 只有在 `warmup/refine` 已证明稳定并且主配置优于匹配 baseline 时，
+   才谨慎重新引入小权重 adversarial 训练。
 
 # 数据是如何采集的？
 `VTP-TL` 数据集采自带有交通信号灯的城市路口，用于预测车辆在一天中不同时段的轨迹，

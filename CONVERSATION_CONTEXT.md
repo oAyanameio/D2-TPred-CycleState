@@ -69,6 +69,7 @@
 - `--gan_weight`
 - `--max_train_batches`
 - `--max_val_batches`
+- `--val_every`
 
 ### 5. Auxiliary supervision 升级
 早期的辅助监督版本是直接监督 hidden state 切片。
@@ -145,6 +146,73 @@
 `signalized intersection forecasting as full-cycle traffic-state memory modeling`
 现在不仅包括状态编码，也包括未来阶段的状态演化。
 
+## 最新的重要实现对齐
+当前最新的重要实现对齐是：
+
+`dynamic rollout recursion + dynamic lane anchor aggregation + metric audit alignment`
+
+其含义是：
+- `queue rollout` 不再在每一步都从最后观测帧的静态 `base_queue_feature` 近似展开，
+  而是显式依赖上一步 rolled meso-state
+- `lane-consensus anchor` 不再固定为最后观测帧 anchor，
+  而是在预测期中动态重聚合
+- 训练内 `validate` 与独立 `evaluate_model.py`
+  现在共用同一套 raw/average displacement 计算函数
+
+当前启示是：
+- 接下来的收益验证会更可信，
+  因为“实现是否真的对应科研故事”与“训练/评估是否口径一致”这两个基础问题
+  已经先被收口了
+
+## 最新的重要协议修正
+当前最新的重要协议修正是：
+
+`smoke/protocol-check validation schedule fix`
+
+其含义是：
+- 旧版 `should_run_validation()` 会在 `max_train_batches > 0` 或 `num_epochs=0`
+  时，于 `batch 0` 后立刻触发验证
+- 当 `max_val_batches` 已经扩大到 20 这类中等预算短实验时，
+  这种行为会让早期噪声过度影响 checkpoint 选择，也会拖慢协议检查
+- 当前版本改为：
+  在 `print_every` 的区间末尾触发验证，并保证最后一个 batch 一定验证
+
+当前启示是：
+- 后续所有 `protocol-check` 短实验都应该基于修复后的调度来读结论，
+  旧 run 只能作为“模型在学”的辅助证据
+
+## 最新的重要可比结果
+当前已经确认两条仓库内可比参考线：
+
+1. `D2TP/model_best.pth.tar` 在统一口径 `num_samples=4` 下，
+   完整 `val` split 得到：
+   - `ADE 38.493`
+   - `FDE 78.706`
+2. 同一 checkpoint 在统一口径 `num_samples=4` 下，
+   完整 `test` split 得到：
+   - `ADE 17.812`
+   - `FDE 37.568`
+
+这说明：
+- baseline checkpoint 在 `test` split 上仍然很强
+- 当前 `CycleState` 与真正“超过 baseline”之间仍有明显距离
+- 后续讨论性能时必须明确 split 与采样口径，不能混用 `val/test`
+
+## 最新的重要 hypothesis 结果
+当前已经完成一次修复后协议下的 rollout 短对照：
+
+- `warmup_main_v2_schedfix`（rollout on）：
+  - `ADE 78.227`
+  - `FDE 152.544`
+- `warmup_no_rollout_v2_schedfix`（仅关闭 rollout）：
+  - `ADE 71.863`
+  - `FDE 140.974`
+
+当前启示是：
+- “真正递推的 queue rollout” 这个主假设还没有在短程 warmup 协议下兑现
+- 下一步优先级不是继续堆新模块，
+  而是修正 rollout 的训练入口、监督强度和状态注入方式
+
 ## 最新的重要结构修正
 当前最新的重要修正是：
 
@@ -166,6 +234,8 @@
 1. 讲好一个强而完整的科研故事
 2. 目标是超过原始论文的实际性能
 3. 避免简单照搬轨迹预测领域里常见的已有套路
+4. 先区分 `smoke / protocol-check / comparable`，
+   再讨论是否“超过 baseline/论文指标”
 
 ## 实际协作说明
 从现在开始，这条研究协作默认发生在：

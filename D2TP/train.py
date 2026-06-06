@@ -112,6 +112,12 @@ parser.add_argument(
 )
 
 parser.add_argument("--best_k", default=20, type=int)
+parser.add_argument(
+    "--num_val_samples",
+    default=20,
+    type=int,
+    help="训练内验证时的采样次数，用于尽量对齐离线评估的 best-of-K 口径。",
+)
 parser.add_argument("--print_every", default=10, type=int)
 parser.add_argument(
     "--max_train_batches",
@@ -124,6 +130,12 @@ parser.add_argument(
     default=0,
     type=int,
     help="仅用于快速实验。大于 0 时，验证时最多评估这么多 batch。",
+)
+parser.add_argument(
+    "--val_every",
+    default=1,
+    type=int,
+    help="正式训练时按 epoch 间隔做验证；smoke run 可继续配合 max_*_batches 使用。",
 )
 parser.add_argument(
     "--generator_only",
@@ -434,6 +446,28 @@ def get_teacher_forcing_ratio(args, epoch):
     return max(0.2, base_ratio - decay)
 
 
+def should_run_validation(args, epoch, batch_idx, num_batches):
+    """统一决定当前批次是否触发验证。
+
+    - smoke / quick run：保留 batch 级快速反馈；
+    - 正式训练：只在满足 `val_every` 的 epoch 末验证一次。
+    """
+    is_smoke_run = (
+        getattr(args, "max_train_batches", 0) > 0
+        or getattr(args, "num_epochs", 0) == 0
+    )
+    if is_smoke_run:
+        batch_interval = max(getattr(args, "print_every", 1), 1)
+        is_interval_boundary = ((batch_idx + 1) % batch_interval) == 0
+        is_last_batch = batch_idx == (num_batches - 1)
+        return is_interval_boundary or is_last_batch
+
+    epoch_offset = max(epoch - getattr(args, "start_epoch", 0), 0)
+    if epoch_offset % max(getattr(args, "val_every", 1), 1) != 0:
+        return False
+    return batch_idx == (num_batches - 1)
+
+
 def prepare_traffic_context(args, model, batch, generator_input):
     """统一构造 CycleState 使用的 traffic context。"""
     base_context = build_traffic_context_from_batch(batch)
@@ -518,6 +552,80 @@ def forward_generator(args, model, batch, teacher_forcing_ratio, training_step=3
             training_step=training_step,
         )
     return pred_traj_fake_rel, traffic_context
+
+
+def evaluate_helper(error, seq_start_end):
+    """把多次采样误差按场景聚合，与独立评估脚本保持一致。"""
+    sum_ = 0
+    error = torch.stack(error, dim=1)
+    for (start, end) in seq_start_end:
+        start = start.item()
+        end = end.item()
+        _error = error[start:end]
+        _error = torch.sum(_error, dim=0)
+        _error = torch.min(_error)
+        sum_ += _error
+    return sum_
+
+
+def compute_raw_displacement_metrics(pred_traj_gt, pred_traj_fake):
+    """返回逐 agent 的原始 ADE/FDE 误差，供训练验证与独立评估共用。"""
+    ade_raw = displacement_error(pred_traj_fake, pred_traj_gt, mode="raw")
+    fde_raw = final_displacement_error(
+        pred_traj_fake[-1], pred_traj_gt[-1], mode="raw"
+    )
+    return ade_raw, fde_raw
+
+
+def compute_average_displacement_metrics(
+    pred_traj_gt,
+    pred_traj_fake,
+    seq_start_end=None,
+):
+    """统一计算平均 ADE/FDE。
+
+    当提供 `seq_start_end` 时，按场景做 best-of-K 风格聚合；
+    否则保持训练内单次采样的直接平均逻辑。
+    """
+    ade_raw, fde_raw = compute_raw_displacement_metrics(pred_traj_gt, pred_traj_fake)
+    if seq_start_end is not None:
+        ade_sum = evaluate_helper([ade_raw], seq_start_end)
+        fde_sum = evaluate_helper([fde_raw], seq_start_end)
+    else:
+        ade_sum = ade_raw.sum()
+        fde_sum = fde_raw.sum()
+    batch = pred_traj_gt.size(1)
+    pred_len = pred_traj_gt.size(0)
+    ade = ade_sum / (batch * pred_len)
+    fde = fde_sum / batch
+    return ade, fde
+
+
+def compute_best_of_k_metrics(
+    ade_candidates,
+    fde_candidates,
+    seq_start_end,
+    pred_len,
+    total_traj,
+):
+    """按场景做多采样 best-of-K 聚合，和离线评估保持一致。"""
+    ade_sum, fde_sum = compute_best_of_k_metric_sums(
+        ade_candidates, fde_candidates, seq_start_end
+    )
+    ade = ade_sum / (total_traj * pred_len)
+    fde = fde_sum / total_traj
+    return ade, fde
+
+
+def compute_best_of_k_metric_sums(
+    ade_candidates,
+    fde_candidates,
+    seq_start_end,
+):
+    """返回 scene-level best-of-K 选择后的误差和。"""
+    ade_sum = evaluate_helper(ade_candidates, seq_start_end)
+    fde_sum = evaluate_helper(fde_candidates, seq_start_end)
+    return ade_sum, fde_sum
 
 
 def maybe_load_compatible_weights(model, state_dict):
@@ -671,7 +779,9 @@ def main(args):
                     training_step,
                     writer,
                 )
-                if batch_idx % args.print_every == 0:
+                if should_run_validation(
+                    args, epoch, batch_idx, len(train_loader)
+                ):
                     ade = validate(args, model, val_loader, epoch, writer)
                     is_best = ade < best_ade
                     best_ade = min(ade, best_ade)
@@ -693,7 +803,9 @@ def main(args):
             else:
                 train(args,len(train_loader), model, batch_idx,batch,Discriminator, optimizer, epoch, training_step, writer)
                 D_step=2
-                if batch_idx % args.print_every == 0:
+                if should_run_validation(
+                    args, epoch, batch_idx, len(train_loader)
+                ):
                     ade = validate(args, model, val_loader, epoch, writer)
                     is_best = ade < best_ade
                     best_ade = min(ade, best_ade)
@@ -927,22 +1039,34 @@ def validate(args, model, val_loader, epoch, writer):
                 seq_start_end,
             ) = batch
 
-            pred_traj_fake_rel, _ = forward_generator(
-                args,
-                model,
-                batch,
-                teacher_forcing_ratio=0.0,
-                training_step=3,
-            )
-
-            pred_traj_fake_rel_predpart = pred_traj_fake_rel[-args.pred_len :]
             obs_traj = obs_traj[:, :, 2:4]
-            pred_traj_fake = relative_to_abs(pred_traj_fake_rel_predpart, obs_traj[-1])
             pred_traj_gt = pred_traj_gt[:, :, 2:4]
-            ade_, fde_ = cal_ade_fde(pred_traj_gt, pred_traj_fake)
-            ade_ = ade_ / (obs_traj.shape[1] * args.pred_len)
-
-            fde_ = fde_ / (obs_traj.shape[1])
+            ade_candidates = []
+            fde_candidates = []
+            for _ in range(args.num_val_samples):
+                pred_traj_fake_rel, _ = forward_generator(
+                    args,
+                    model,
+                    batch,
+                    teacher_forcing_ratio=0.0,
+                    training_step=3,
+                )
+                pred_traj_fake_rel_predpart = pred_traj_fake_rel[-args.pred_len :]
+                pred_traj_fake = relative_to_abs(
+                    pred_traj_fake_rel_predpart, obs_traj[-1]
+                )
+                ade_raw, fde_raw = compute_raw_displacement_metrics(
+                    pred_traj_gt, pred_traj_fake
+                )
+                ade_candidates.append(ade_raw)
+                fde_candidates.append(fde_raw)
+            ade_, fde_ = compute_best_of_k_metrics(
+                ade_candidates,
+                fde_candidates,
+                seq_start_end,
+                args.pred_len,
+                obs_traj.shape[1],
+            )
             ade.update(ade_, obs_traj.shape[1])
             fde.update(fde_, obs_traj.shape[1])
 

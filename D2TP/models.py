@@ -1210,9 +1210,17 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                     )
         return anchor_seq
 
+    def build_lane_queue_anchor(self, queue_feature, lane_ids, seq_start_end):
+        """构造单步 lane-level meso anchor。"""
+        return self.build_lane_queue_anchor_seq(
+            queue_feature.unsqueeze(0),
+            lane_ids.unsqueeze(0),
+            seq_start_end,
+        ).squeeze(0)
+
     def rollout_queue_features(
         self,
-        base_queue_feature,
+        prev_queue_feature,
         current_cycle_feature,
         last_pred_offset,
         step_index,
@@ -1230,7 +1238,7 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         phase_change = current_cycle_feature[:, 5:6]
         phase_id = phase_one_hot.argmax(dim=1)
 
-        rolled = base_queue_feature.clone()
+        rolled = prev_queue_feature.clone()
         waiting_ratio = rolled[:, 3]
         release_ratio = rolled[:, 4]
         phase_value = rolled[:, 5]
@@ -1327,6 +1335,102 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         rolled[:, 9] = stopline_occupancy
         rolled[:, 10] = front_of_queue
         return rolled
+
+    def get_decode_step_context(
+        self,
+        step_index,
+        pred_traj_rel,
+        obs_traj_pos,
+        obs_state,
+        pred_state,
+    ):
+        """统一训练态/推理态的单步灯态与周期上下文构造。"""
+        if step_index == 0:
+            light_state = self.get_last_state(obs_traj_pos, obs_state)
+            current_cycle_feature = self.get_step_cycle_feature(obs_state[-1])
+        else:
+            light_state = self.get_next_state(
+                pred_traj_rel, obs_traj_pos, pred_state
+            )
+            current_cycle_feature = self.get_step_cycle_feature(
+                pred_state[step_index - 1]
+            )
+        light_state_embedding = self.light_embedding(light_state)
+        cycle_step_embedding = self.cycle_step_embedding(current_cycle_feature)
+        return light_state_embedding, current_cycle_feature, cycle_step_embedding
+
+    def rollout_queue_step(
+        self,
+        prev_queue_feature,
+        lane_queue_anchor,
+        lane_ids,
+        seq_start_end,
+        current_cycle_feature,
+        last_pred_offset,
+        step_index,
+        light_state_embedding,
+        cycle_step_embedding,
+        rollout_queue_h_t,
+        rollout_queue_c_t,
+    ):
+        """统一执行一轮预测期 meso rollout。"""
+        current_queue_feature = self.rollout_queue_features(
+            prev_queue_feature,
+            current_cycle_feature,
+            last_pred_offset,
+            step_index,
+        )
+        used_lane_queue_anchor = None
+        next_lane_queue_anchor = lane_queue_anchor
+        if not self.disable_lane_queue_anchor:
+            used_lane_queue_anchor = lane_queue_anchor
+            lane_anchor_gate = self.lane_queue_anchor_gate(
+                torch.cat(
+                    (
+                        current_queue_feature,
+                        current_cycle_feature,
+                        light_state_embedding,
+                    ),
+                    dim=1,
+                )
+            )
+            current_queue_feature = (
+                (1.0 - lane_anchor_gate) * current_queue_feature
+                + lane_anchor_gate * lane_queue_anchor
+            )
+            next_lane_queue_anchor = self.build_lane_queue_anchor(
+                current_queue_feature, lane_ids, seq_start_end
+            )
+        queue_rollout_input = torch.cat(
+            (current_queue_feature, current_cycle_feature, last_pred_offset),
+            dim=1,
+        )
+        queue_rollout_embed = self.queue_rollout_feature_mlp(queue_rollout_input)
+        rollout_queue_h_t, rollout_queue_c_t = self.queue_lstm_model(
+            queue_rollout_embed, (rollout_queue_h_t, rollout_queue_c_t)
+        )
+        if not self.disable_state_gating:
+            rollout_queue_h_t = rollout_queue_h_t * self.queue_rollout_gate(
+                torch.cat(
+                    (
+                        light_state_embedding,
+                        rollout_queue_h_t,
+                        cycle_step_embedding,
+                    ),
+                    dim=1,
+                )
+            )
+        return {
+            "queue_feature": current_queue_feature,
+            "used_lane_queue_anchor": used_lane_queue_anchor,
+            "next_lane_queue_anchor": next_lane_queue_anchor,
+            "queue_hidden": rollout_queue_h_t,
+            "queue_cell": rollout_queue_c_t,
+            "queue_pred": self.queue_aux_head(rollout_queue_h_t),
+            "queue_target": self.compute_queue_targets(
+                current_queue_feature.unsqueeze(0)
+            ).squeeze(0),
+        }
 
     def build_traffic_context(
         self,
@@ -1442,11 +1546,14 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
             "queue_pred_last": None,
             "cycle_pred_last": None,
             "queue_rollout_hidden_seq": None,
+            "queue_rollout_feature_seq": None,
             "queue_rollout_pred_seq": None,
             "queue_rollout_target_seq": None,
             "lane_queue_rollout_anchor_seq": None,
             "decoder_state_init_residual": None,
+            "decoder_state_init_residual_norm": None,
             "decoder_state_step_residual_seq": None,
+            "decoder_state_step_residual_norm_seq": None,
             "traffic_context": traffic_context,
         }
 
@@ -1529,19 +1636,24 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
             self.debug_last_aux["decoder_state_init_residual"] = (
                 init_state_residual.detach()
             )
+            self.debug_last_aux["decoder_state_init_residual_norm"] = (
+                init_state_residual.detach().norm(dim=1)
+            )
         pred_lstm_c_t = torch.zeros_like(pred_lstm_hidden)
 
         obs_traj_rel = obs_traj_rel[:, :, 2:4]
         output = obs_traj_rel[self.obs_len - 1]
         queue_rollout_hidden_seq = []
+        queue_rollout_feature_seq = []
         queue_rollout_pred_seq = []
         queue_rollout_target_seq = []
         lane_queue_rollout_anchor_seq = []
         decoder_state_residual_seq = []
         rollout_queue_h_t = gated_queue_last
         rollout_queue_c_t = torch.zeros_like(gated_queue_last)
-        base_queue_feature = queue_feature_seq[-1]
-        lane_queue_anchor = lane_queue_anchor_seq[-1]
+        rollout_queue_feature = queue_feature_seq[-1]
+        rollout_lane_queue_anchor = lane_queue_anchor_seq[-1]
+        rollout_lane_ids = traffic_context["agent"]["lane_ids"][-1]
         if self.training:
             for i, input_t in enumerate(
                 obs_traj_rel[-self.pred_len :].chunk(self.pred_len, dim=0)
@@ -1551,69 +1663,43 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                 pred_lstm_hidden, pred_lstm_c_t = self.pred_lstm_model(
                     input_t.squeeze(0), (pred_lstm_hidden, pred_lstm_c_t)
                 )
-                if i == 0:
-                    light_state = self.get_last_state(obs_traj_pos, obs_state)
-                    current_cycle_feature = self.get_step_cycle_feature(obs_state[-1])
-                else:
-                    light_state = self.get_next_state(
-                        pred_traj_rel, obs_traj_pos, pred_state
-                    )
-                    current_cycle_feature = self.get_step_cycle_feature(
-                        pred_state[i - 1]
-                    )
-                light_state_embedding = self.light_embedding(light_state)
-                cycle_step_embedding = self.cycle_step_embedding(
-                    current_cycle_feature
+                (
+                    light_state_embedding,
+                    current_cycle_feature,
+                    cycle_step_embedding,
+                ) = self.get_decode_step_context(
+                    i,
+                    pred_traj_rel,
+                    obs_traj_pos,
+                    obs_state,
+                    pred_state,
                 )
                 if not self.disable_queue_rollout:
-                    current_queue_feature = self.rollout_queue_features(
-                        base_queue_feature,
+                    rollout_info = self.rollout_queue_step(
+                        rollout_queue_feature,
+                        rollout_lane_queue_anchor,
+                        rollout_lane_ids,
+                        seq_start_end,
                         current_cycle_feature,
                         input_t.squeeze(0),
                         i,
+                        light_state_embedding,
+                        cycle_step_embedding,
+                        rollout_queue_h_t,
+                        rollout_queue_c_t,
                     )
-                    if not self.disable_lane_queue_anchor:
-                        lane_queue_rollout_anchor_seq.append(lane_queue_anchor)
-                        lane_anchor_gate = self.lane_queue_anchor_gate(
-                            torch.cat(
-                                (
-                                    current_queue_feature,
-                                    current_cycle_feature,
-                                    light_state_embedding,
-                                ),
-                                dim=1,
-                            )
+                    rollout_queue_feature = rollout_info["queue_feature"]
+                    rollout_lane_queue_anchor = rollout_info["next_lane_queue_anchor"]
+                    rollout_queue_h_t = rollout_info["queue_hidden"]
+                    rollout_queue_c_t = rollout_info["queue_cell"]
+                    if rollout_info["used_lane_queue_anchor"] is not None:
+                        lane_queue_rollout_anchor_seq.append(
+                            rollout_info["used_lane_queue_anchor"]
                         )
-                        current_queue_feature = (
-                            (1.0 - lane_anchor_gate) * current_queue_feature
-                            + lane_anchor_gate * lane_queue_anchor
-                        )
-                    queue_rollout_input = torch.cat(
-                        (current_queue_feature, current_cycle_feature, input_t.squeeze(0)),
-                        dim=1,
-                    )
-                    queue_rollout_embed = self.queue_rollout_feature_mlp(
-                        queue_rollout_input
-                    )
-                    rollout_queue_h_t, rollout_queue_c_t = self.queue_lstm_model(
-                        queue_rollout_embed, (rollout_queue_h_t, rollout_queue_c_t)
-                    )
-                    if not self.disable_state_gating:
-                        rollout_queue_h_t = rollout_queue_h_t * self.queue_rollout_gate(
-                            torch.cat(
-                                (
-                                    light_state_embedding,
-                                    rollout_queue_h_t,
-                                    cycle_step_embedding,
-                                ),
-                                dim=1,
-                            )
-                        )
+                    queue_rollout_feature_seq.append(rollout_queue_feature)
                     queue_rollout_hidden_seq.append(rollout_queue_h_t)
-                    queue_rollout_pred_seq.append(self.queue_aux_head(rollout_queue_h_t))
-                    queue_rollout_target_seq.append(
-                        self.compute_queue_targets(current_queue_feature.unsqueeze(0)).squeeze(0)
-                    )
+                    queue_rollout_pred_seq.append(rollout_info["queue_pred"])
+                    queue_rollout_target_seq.append(rollout_info["queue_target"])
                     queue_context_for_decode = rollout_queue_h_t
                 else:
                     queue_context_for_decode = gated_queue_last
@@ -1637,69 +1723,43 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                 pred_lstm_hidden, pred_lstm_c_t = self.pred_lstm_model(
                     output, (pred_lstm_hidden, pred_lstm_c_t)
                 )
-                if i == 0:
-                    light_state = self.get_last_state(obs_traj_pos, obs_state)
-                    current_cycle_feature = self.get_step_cycle_feature(obs_state[-1])
-                else:
-                    light_state = self.get_next_state(
-                        pred_traj_rel, obs_traj_pos, pred_state
-                    )
-                    current_cycle_feature = self.get_step_cycle_feature(
-                        pred_state[i - 1]
-                    )
-                light_state_embedding = self.light_embedding(light_state)
-                cycle_step_embedding = self.cycle_step_embedding(
-                    current_cycle_feature
+                (
+                    light_state_embedding,
+                    current_cycle_feature,
+                    cycle_step_embedding,
+                ) = self.get_decode_step_context(
+                    i,
+                    pred_traj_rel,
+                    obs_traj_pos,
+                    obs_state,
+                    pred_state,
                 )
                 if not self.disable_queue_rollout:
-                    current_queue_feature = self.rollout_queue_features(
-                        base_queue_feature,
+                    rollout_info = self.rollout_queue_step(
+                        rollout_queue_feature,
+                        rollout_lane_queue_anchor,
+                        rollout_lane_ids,
+                        seq_start_end,
                         current_cycle_feature,
                         output,
                         i,
+                        light_state_embedding,
+                        cycle_step_embedding,
+                        rollout_queue_h_t,
+                        rollout_queue_c_t,
                     )
-                    if not self.disable_lane_queue_anchor:
-                        lane_queue_rollout_anchor_seq.append(lane_queue_anchor)
-                        lane_anchor_gate = self.lane_queue_anchor_gate(
-                            torch.cat(
-                                (
-                                    current_queue_feature,
-                                    current_cycle_feature,
-                                    light_state_embedding,
-                                ),
-                                dim=1,
-                            )
+                    rollout_queue_feature = rollout_info["queue_feature"]
+                    rollout_lane_queue_anchor = rollout_info["next_lane_queue_anchor"]
+                    rollout_queue_h_t = rollout_info["queue_hidden"]
+                    rollout_queue_c_t = rollout_info["queue_cell"]
+                    if rollout_info["used_lane_queue_anchor"] is not None:
+                        lane_queue_rollout_anchor_seq.append(
+                            rollout_info["used_lane_queue_anchor"]
                         )
-                        current_queue_feature = (
-                            (1.0 - lane_anchor_gate) * current_queue_feature
-                            + lane_anchor_gate * lane_queue_anchor
-                        )
-                    queue_rollout_input = torch.cat(
-                        (current_queue_feature, current_cycle_feature, output),
-                        dim=1,
-                    )
-                    queue_rollout_embed = self.queue_rollout_feature_mlp(
-                        queue_rollout_input
-                    )
-                    rollout_queue_h_t, rollout_queue_c_t = self.queue_lstm_model(
-                        queue_rollout_embed, (rollout_queue_h_t, rollout_queue_c_t)
-                    )
-                    if not self.disable_state_gating:
-                        rollout_queue_h_t = rollout_queue_h_t * self.queue_rollout_gate(
-                            torch.cat(
-                                (
-                                    light_state_embedding,
-                                    rollout_queue_h_t,
-                                    cycle_step_embedding,
-                                ),
-                                dim=1,
-                            )
-                        )
+                    queue_rollout_feature_seq.append(rollout_queue_feature)
                     queue_rollout_hidden_seq.append(rollout_queue_h_t)
-                    queue_rollout_pred_seq.append(self.queue_aux_head(rollout_queue_h_t))
-                    queue_rollout_target_seq.append(
-                        self.compute_queue_targets(current_queue_feature.unsqueeze(0)).squeeze(0)
-                    )
+                    queue_rollout_pred_seq.append(rollout_info["queue_pred"])
+                    queue_rollout_target_seq.append(rollout_info["queue_target"])
                     queue_context_for_decode = rollout_queue_h_t
                 else:
                     queue_context_for_decode = gated_queue_last
@@ -1723,6 +1783,9 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
             self.debug_last_aux["queue_rollout_hidden_seq"] = torch.stack(
                 queue_rollout_hidden_seq
             )
+            self.debug_last_aux["queue_rollout_feature_seq"] = torch.stack(
+                queue_rollout_feature_seq
+            )
             self.debug_last_aux["queue_rollout_pred_seq"] = torch.stack(
                 queue_rollout_pred_seq
             )
@@ -1736,6 +1799,9 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         if decoder_state_residual_seq:
             self.debug_last_aux["decoder_state_step_residual_seq"] = torch.stack(
                 decoder_state_residual_seq
+            )
+            self.debug_last_aux["decoder_state_step_residual_norm_seq"] = torch.stack(
+                [step_residual.detach().norm(dim=1) for step_residual in decoder_state_residual_seq]
             )
         return torch.stack(pred_traj_rel)
 
