@@ -42,6 +42,12 @@
 - `teacher_forcing_ratio`:
 - `max_train_batches`:
 - `max_val_batches`:
+- `val_dset_type`:
+- `num_val_samples`:
+- `grad_clip`:
+- `aux_rollout_weight`:
+- `rollout_residual_scale`:
+- `detach_rollout_state`:
 - Command：
 - Best validation ADE：
 - Best validation FDE：
@@ -618,3 +624,85 @@
   2. 当前短程最佳点更接近 `aux_rollout_weight=2.5`，而不是 `1.0`
   3. 当前更大的问题已经从“rollout 是否有效”
      转移到“warmup 在更长短程训练上整体不稳”
+
+## Stage 24：协议优先稳定化实现
+### Code Change
+- 训练内验证 split 从历史上的隐式 `test` 改为可配置参数：
+  - 新增 `--val_dset_type {val,test}`
+  - 默认 `val`
+  - `test` 仅用于最终复核或兼容旧协议
+- 修复 `--lr` 被忽略的问题：
+  - 新增 `build_optimizers()`
+  - 生成器和判别器 RMSprop 均使用 `args.lr`
+- 新增 warmup/refine 稳定化默认值：
+  - `grad_clip=1.0`
+  - warmup `rollout_residual_scale=0.35`
+  - refine/adversarial `rollout_residual_scale=0.7`
+  - warmup `detach_rollout_state=True`
+- `--detach_rollout_state` 支持显式开关：
+  - `--detach_rollout_state`
+  - `--no_detach_rollout_state`
+- `CycleStateTrajectoryGenerator` 新增 bounded rollout residual injection：
+  - decoder queue context 仍为 `observed queue context + rollout delta`
+  - rollout delta 先经过 `tanh` 限幅
+  - 再乘以 `rollout_residual_scale`
+  - 当 `rollout_residual_scale=0` 时，严格退化为纯 observed queue context
+- 新增 warmup rollout-state detach：
+  - 预测期每一步 rollout 仍产生 queue prediction 与 decoder context
+  - 但 warmup 默认截断下一步 rollout state 的跨步反传
+  - 目的：先学可预测的 meso-state，再学习长链状态耦合
+- 新增训练日志稳定性指标：
+  - `StateStability | DInitNorm ... DStepNorm ... QRollHNorm ... PredOffsetNorm ... GradNorm ...`
+  - TensorBoard scalar：
+    - `state_decoder_init_residual_norm`
+    - `state_decoder_step_residual_norm`
+    - `state_queue_rollout_hidden_norm`
+    - `state_pred_offset_norm`
+    - `g_grad_norm`
+- `evaluate_model.py` 同步支持：
+  - `--rollout_residual_scale`
+  - `--detach_rollout_state`
+  - 以保证新协议 checkpoint 能按同构模型离线评估
+
+### Tests
+- 新增/更新单元测试覆盖：
+  - 训练内验证默认走 `val` split
+  - `--val_dset_type test` 可显式恢复旧 split
+  - `--lr` 能真实传入优化器
+  - `warmup` 默认启用 `grad_clip`、低强度 rollout residual、rollout-state detach
+  - `--no_detach_rollout_state` 能覆盖 warmup 默认
+  - `rollout_residual_scale=0` 退化为 observed queue context
+  - `detach_rollout_state=True` 时 rollout prediction 仍存在，但第二步 hidden 输入已 detach
+  - 状态稳定性日志 helper 能正确汇总 debug norms
+  - `evaluate_model.py` 暴露新协议参数
+
+### Recommended Next Runs
+1. `baseline_audit_v2_val_full_num_samples20`
+   - Tag：`comparable`
+   - Command：
+     `python D2TP/evaluate_model.py --model_type d2tpred --device cuda --loader_num_workers 0 --batch_size 16 --num_samples 20 --eval_print_every 10 --resume D2TP/model_best.pth.tar --dset_type val`
+2. `baseline_audit_v2_test_full_num_samples20`
+   - Tag：`comparable`
+   - Command：
+     `python D2TP/evaluate_model.py --model_type d2tpred --device cuda --loader_num_workers 0 --batch_size 16 --num_samples 20 --eval_print_every 10 --resume D2TP/model_best.pth.tar --dset_type test`
+3. `experiments/cyclestate/warmup_protocol_stable_v1_50b`
+   - Tag：`protocol-check`
+   - Command：
+     `python D2TP/train.py --log_dir experiments/cyclestate/warmup_protocol_stable_v1_50b --model_type cyclestate --train_stage warmup --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --best_k 4 --num_val_samples 4 --aux_rollout_weight 2.5 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 50 --max_train_batches 50 --max_val_batches 20 --val_dset_type val`
+4. `experiments/cyclestate/warmup_protocol_stable_v1_100b`
+   - Tag：`protocol-check`
+   - Command：
+     `python D2TP/train.py --log_dir experiments/cyclestate/warmup_protocol_stable_v1_100b --model_type cyclestate --train_stage warmup --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --best_k 4 --num_val_samples 4 --aux_rollout_weight 2.5 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 50 --max_train_batches 100 --max_val_batches 20 --val_dset_type val`
+
+### Current Interpretation
+- Stage 24 不改变科研故事，也不引入外部通用结构。
+- 本阶段专门解决此前 `100-batch` 后半程崩坏暴露出的协议问题：
+  - split 混用
+  - learning rate 参数无效
+  - 缺少梯度约束
+  - rollout delta 注入缺少幅值约束
+  - warmup 阶段状态链路反传过长
+- 下一步判断标准固定为：
+  - `100-batch` 的 true-val ADE 不得比 `50-batch` 恶化超过 `15%`
+  - rollout-on 仍需优于匹配 no-rollout
+  - 通过后再进入 `refine`

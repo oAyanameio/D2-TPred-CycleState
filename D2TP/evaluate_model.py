@@ -80,6 +80,17 @@ parser.add_argument(
     action="store_true",
     help="关闭 CycleState 的 baseline-compatible decoder state residual，用于评估无残差状态注入版本。",
 )
+parser.add_argument(
+    "--rollout_residual_scale",
+    default=1.0,
+    type=float,
+    help="CycleState rollout queue delta 注入 decoder 的缩放系数，需与训练 checkpoint 协议一致。",
+)
+parser.add_argument(
+    "--detach_rollout_state",
+    action="store_true",
+    help="评估时保留参数兼容；eval 模式下不会截断额外训练梯度。",
+)
 
 
 parser.add_argument("--num_samples", default=20, type=int)
@@ -160,6 +171,8 @@ def get_generator(checkpoint):
         model_kwargs["disable_decoder_state_residual"] = (
             args.disable_decoder_state_residual
         )
+        model_kwargs["rollout_residual_scale"] = args.rollout_residual_scale
+        model_kwargs["detach_rollout_state"] = args.detach_rollout_state
     model = model_cls(**model_kwargs)
     model.load_state_dict(checkpoint["state_dict"])
     model.to(args.device)

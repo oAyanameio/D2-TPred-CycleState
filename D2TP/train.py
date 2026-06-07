@@ -132,6 +132,12 @@ parser.add_argument(
     help="仅用于快速实验。大于 0 时，验证时最多评估这么多 batch。",
 )
 parser.add_argument(
+    "--val_dset_type",
+    default="val",
+    choices=["val", "test"],
+    help="训练内验证使用的数据 split。默认 val，test 只用于最终复核或兼容旧协议。",
+)
+parser.add_argument(
     "--val_every",
     default=1,
     type=int,
@@ -187,6 +193,32 @@ parser.add_argument(
     action="store_true",
     help="关闭 baseline-compatible decoder state residual，使状态分支不再残差调制原始解码器。",
 )
+parser.add_argument(
+    "--grad_clip",
+    default=None,
+    type=float,
+    help="生成器/判别器梯度裁剪阈值。CycleState warmup/refine 默认启用。",
+)
+parser.add_argument(
+    "--rollout_residual_scale",
+    default=None,
+    type=float,
+    help="CycleState rollout queue delta 注入 decoder 的缩放系数。",
+)
+detach_rollout_group = parser.add_mutually_exclusive_group()
+detach_rollout_group.add_argument(
+    "--detach_rollout_state",
+    action="store_true",
+    dest="detach_rollout_state",
+    default=None,
+    help="截断预测期 queue rollout 跨步反传，用于 warmup 稳定化。",
+)
+detach_rollout_group.add_argument(
+    "--no_detach_rollout_state",
+    action="store_false",
+    dest="detach_rollout_state",
+    help="显式关闭预测期 queue rollout 跨步截断，用于消融或 refine 复核。",
+)
 parser.add_argument("--use_gpu", default=1, type=int)
 parser.add_argument("--gpu_num", default="2", type=str)
 CUDA_VISIBLE_DEVICES = '2'
@@ -219,6 +251,9 @@ TRAIN_STAGE_DEFAULTS = {
         "aux_queue_weight": 10.0,
         "aux_cycle_weight": 5.0,
         "teacher_forcing_ratio": 0.8,
+        "grad_clip": 1.0,
+        "rollout_residual_scale": 0.35,
+        "detach_rollout_state": True,
     },
     "refine": {
         "generator_only": True,
@@ -226,6 +261,9 @@ TRAIN_STAGE_DEFAULTS = {
         "aux_queue_weight": 3.0,
         "aux_cycle_weight": 1.5,
         "teacher_forcing_ratio": 0.6,
+        "grad_clip": 1.0,
+        "rollout_residual_scale": 0.7,
+        "detach_rollout_state": False,
     },
     "adversarial": {
         "generator_only": False,
@@ -233,6 +271,9 @@ TRAIN_STAGE_DEFAULTS = {
         "aux_queue_weight": 3.0,
         "aux_cycle_weight": 1.5,
         "teacher_forcing_ratio": 0.4,
+        "grad_clip": 1.0,
+        "rollout_residual_scale": 0.7,
+        "detach_rollout_state": False,
     },
 }
 
@@ -242,6 +283,9 @@ BASELINE_DEFAULTS = {
     "aux_queue_weight": 0.0,
     "aux_cycle_weight": 0.0,
     "teacher_forcing_ratio": 0.5,
+    "grad_clip": 0.0,
+    "rollout_residual_scale": 1.0,
+    "detach_rollout_state": False,
 }
 
 
@@ -457,6 +501,64 @@ def get_teacher_forcing_ratio(args, epoch):
     return max(0.2, base_ratio - decay)
 
 
+def get_validation_dset_path(args):
+    """返回训练内验证使用的 split 路径。"""
+    return get_dset_path(args.dataset_name, getattr(args, "val_dset_type", "val"))
+
+
+def build_optimizers(args, model, discriminator):
+    """构造优化器，确保命令行 lr 真正生效。"""
+    return (
+        optim.RMSprop(model.parameters(), lr=args.lr),
+        optim.RMSprop(discriminator.parameters(), lr=args.lr),
+    )
+
+
+def maybe_clip_gradients(parameters, grad_clip):
+    """按需裁剪梯度；返回裁剪前范数，便于日志分析。"""
+    if grad_clip is None or grad_clip <= 0:
+        return None
+    return torch.nn.utils.clip_grad_norm_(parameters, grad_clip)
+
+
+def _mean_norm_from_tensor(tensor):
+    if tensor is None:
+        return 0.0
+    if tensor.numel() == 0:
+        return 0.0
+    if tensor.dim() == 0:
+        return float(tensor.detach().item())
+    if tensor.dim() == 1:
+        return float(tensor.detach().float().mean().item())
+    return float(tensor.detach().float().norm(dim=-1).mean().item())
+
+
+def _mean_value_from_tensor(tensor):
+    if tensor is None:
+        return 0.0
+    if tensor.numel() == 0:
+        return 0.0
+    return float(tensor.detach().float().mean().item())
+
+
+def extract_state_stability_metrics(debug_info, pred_offsets):
+    """提取状态注入稳定性指标，用于定位 warmup 后半程崩坏。"""
+    if debug_info is None:
+        debug_info = {}
+    return {
+        "decoder_state_init_residual_norm": _mean_value_from_tensor(
+            debug_info.get("decoder_state_init_residual_norm")
+        ),
+        "decoder_state_step_residual_norm": _mean_value_from_tensor(
+            debug_info.get("decoder_state_step_residual_norm_seq")
+        ),
+        "queue_rollout_hidden_norm": _mean_norm_from_tensor(
+            debug_info.get("queue_rollout_hidden_seq")
+        ),
+        "pred_offset_norm": _mean_norm_from_tensor(pred_offsets),
+    }
+
+
 def should_run_validation(args, epoch, batch_idx, num_batches):
     """统一决定当前批次是否触发验证。
 
@@ -664,7 +766,7 @@ def main(args):
     torch.backends.cudnn.benchmark = False
 
     train_path = get_dset_path(args.dataset_name, "train")
-    val_path = get_dset_path(args.dataset_name, "test")
+    val_path = get_validation_dset_path(args)
 
     logging.info("Initializing train dataset")
     train_dset, train_loader = data_loader(args, train_path)
@@ -707,6 +809,8 @@ def main(args):
         model_kwargs["disable_decoder_state_residual"] = (
             args.disable_decoder_state_residual
         )
+        model_kwargs["rollout_residual_scale"] = args.rollout_residual_scale
+        model_kwargs["detach_rollout_state"] = args.detach_rollout_state
     model = model_cls(**model_kwargs)
     model.to(args.device)
     # 判别器用于判断生成轨迹是否像真实数据。
@@ -724,17 +828,21 @@ def main(args):
     )
     Discriminator.to(args.device)
 
-    optimizer = optim.RMSprop(model.parameters(), lr=1e-3)
-    optimizer_d = optim.RMSprop(Discriminator.parameters(), lr=1e-3)
+    optimizer, optimizer_d = build_optimizers(args, model, Discriminator)
     logging.info(
-        "Training protocol | model_type=%s stage=%s generator_only=%s gan_weight=%.3f aux_queue=%.3f aux_rollout=%.3f aux_cycle=%.3f disable_state_gating=%s disable_queue_rollout=%s disable_lane_queue_anchor=%s disable_decoder_state_residual=%s teacher_forcing=%.3f",
+        "Training protocol | model_type=%s stage=%s val_split=%s lr=%.6f grad_clip=%.3f generator_only=%s gan_weight=%.3f aux_queue=%.3f aux_rollout=%.3f aux_cycle=%.3f rollout_residual_scale=%.3f detach_rollout_state=%s disable_state_gating=%s disable_queue_rollout=%s disable_lane_queue_anchor=%s disable_decoder_state_residual=%s teacher_forcing=%.3f",
         args.model_type,
         args.train_stage,
+        args.val_dset_type,
+        args.lr,
+        args.grad_clip,
         args.generator_only,
         args.gan_weight,
         args.aux_queue_weight,
         args.aux_rollout_weight,
         args.aux_cycle_weight,
+        args.rollout_residual_scale,
+        args.detach_rollout_state,
         args.disable_state_gating,
         args.disable_queue_rollout,
         args.disable_lane_queue_anchor,
@@ -971,10 +1079,22 @@ def train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, trai
         + aux_queue_rollout_loss * args.aux_rollout_weight
         + aux_cycle_loss * args.aux_cycle_weight
     )
+    stability_metrics = extract_state_stability_metrics(
+        getattr(model, "debug_last_aux", None), pred_traj_fake_rel
+    )
     total_loss.backward()
+    grad_norm = maybe_clip_gradients(model.parameters(), args.grad_clip)
     optimizer.step()
     if batch_idx % args.print_every == 0:
         progress.display(batch_idx)
+        logging.info(
+            "StateStability | DInitNorm %.6f DStepNorm %.6f QRollHNorm %.6f PredOffsetNorm %.6f GradNorm %.6f",
+            stability_metrics["decoder_state_init_residual_norm"],
+            stability_metrics["decoder_state_step_residual_norm"],
+            stability_metrics["queue_rollout_hidden_norm"],
+            stability_metrics["pred_offset_norm"],
+            float(grad_norm.item() if grad_norm is not None else 0.0),
+        )
     writer.add_scalar("g_l2_loss", losses.avg, batch_idx)
     writer.add_scalar("g_ad_loss", g_losses.avg * args.gan_weight, batch_idx)
     writer.add_scalar("g_queue_reg_loss", aux_queue_reg_losses.avg, batch_idx)
@@ -984,6 +1104,31 @@ def train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, trai
     writer.add_scalar("g_cycle_phase_loss", aux_cycle_phase_losses.avg, batch_idx)
     writer.add_scalar("g_cycle_time_loss", aux_cycle_time_losses.avg, batch_idx)
     writer.add_scalar("g_cycle_change_loss", aux_cycle_change_losses.avg, batch_idx)
+    writer.add_scalar(
+        "state_decoder_init_residual_norm",
+        stability_metrics["decoder_state_init_residual_norm"],
+        batch_idx,
+    )
+    writer.add_scalar(
+        "state_decoder_step_residual_norm",
+        stability_metrics["decoder_state_step_residual_norm"],
+        batch_idx,
+    )
+    writer.add_scalar(
+        "state_queue_rollout_hidden_norm",
+        stability_metrics["queue_rollout_hidden_norm"],
+        batch_idx,
+    )
+    writer.add_scalar(
+        "state_pred_offset_norm",
+        stability_metrics["pred_offset_norm"],
+        batch_idx,
+    )
+    writer.add_scalar(
+        "g_grad_norm",
+        float(grad_norm.item() if grad_norm is not None else 0.0),
+        batch_idx,
+    )
 
 def D_train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, training_step, writer):
     """更新判别器。"""
@@ -1023,6 +1168,7 @@ def D_train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, tr
 
     D_losses.update(D_loss.item(), obs_traj.shape[1])
     D_loss.backward()
+    maybe_clip_gradients(Discriminator.parameters(), args.grad_clip)
     optimizer.step()
     if batch_idx % args.print_every == 0:
         progress.display(batch_idx)

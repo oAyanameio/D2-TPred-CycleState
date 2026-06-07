@@ -292,6 +292,84 @@ class CycleStateProtocolTest(unittest.TestCase):
         rollout_distance = (rollout_queue_context - observed_queue_context).norm(dim=1)
         self.assertTrue(torch.all(observed_distance < rollout_distance))
 
+    def test_rollout_residual_scale_zero_keeps_observed_queue_context(self):
+        bounded_model = models.CycleStateTrajectoryGenerator(
+            obs_len=8,
+            pred_len=12,
+            traj_lstm_input_size=2,
+            traj_lstm_hidden_size=32,
+            n_units=[32, 16, 32],
+            n_heads=[4, 1],
+            graph_network_out_dims=32,
+            dropout=0.0,
+            alpha=0.2,
+            graph_lstm_hidden_size=32,
+            noise_dim=(16,),
+            noise_type="gaussian",
+            rollout_residual_scale=0.0,
+        )
+        observed = torch.randn(3, bounded_model.queue_lstm_hidden_size)
+        rollout = observed + torch.randn_like(observed)
+        light = torch.randn(3, bounded_model.light_embedding_size)
+
+        decoded = bounded_model.build_rollout_decode_queue_context(
+            observed, rollout, light
+        )
+
+        self.assertTrue(torch.allclose(decoded, observed))
+
+    def test_detach_rollout_state_keeps_outputs_but_cuts_cross_step_hidden_grad(self):
+        detach_model = models.CycleStateTrajectoryGenerator(
+            obs_len=8,
+            pred_len=12,
+            traj_lstm_input_size=2,
+            traj_lstm_hidden_size=32,
+            n_units=[32, 16, 32],
+            n_heads=[4, 1],
+            graph_network_out_dims=32,
+            dropout=0.0,
+            alpha=0.2,
+            graph_lstm_hidden_size=32,
+            noise_dim=(16,),
+            noise_type="gaussian",
+            detach_rollout_state=True,
+        )
+        traffic_context = detach_model.build_traffic_context(
+            self.obs_traj_rel,
+            self.obs_traj,
+            self.obs_state,
+            self.pred_state,
+            self.seq_start_end,
+        )
+        hidden_requires_grad = []
+        original_step = detach_model.rollout_queue_step
+
+        def capture_rollout_step(*args, **kwargs):
+            rollout_queue_h_t = args[9]
+            hidden_requires_grad.append(rollout_queue_h_t.requires_grad)
+            return original_step(*args, **kwargs)
+
+        with mock.patch.object(
+            detach_model,
+            "rollout_queue_step",
+            side_effect=capture_rollout_step,
+        ):
+            detach_model.train()
+            detach_model(
+                self.obs_traj_rel,
+                self.obs_traj,
+                self.obs_state,
+                self.pred_state,
+                self.seq_start_end,
+                teacher_forcing_ratio=1.0,
+                traffic_context=traffic_context,
+            )
+
+        self.assertIsNotNone(detach_model.debug_last_aux["queue_rollout_pred_seq"])
+        self.assertGreaterEqual(len(hidden_requires_grad), 2)
+        self.assertTrue(hidden_requires_grad[0])
+        self.assertFalse(hidden_requires_grad[1])
+
     def test_lane_anchor_rollout_is_dynamic_after_first_step(self):
         traffic_context = self.model.build_traffic_context(
             self.obs_traj_rel,
@@ -501,13 +579,20 @@ class CycleStateProtocolTest(unittest.TestCase):
             generator_only=None,
             gan_weight=None,
             aux_queue_weight=None,
+            aux_rollout_weight=None,
             aux_cycle_weight=None,
+            grad_clip=None,
+            rollout_residual_scale=None,
+            detach_rollout_state=None,
         )
         train.apply_stage_defaults(args)
         self.assertTrue(args.generator_only)
         self.assertEqual(0.0, args.gan_weight)
         self.assertGreater(args.aux_queue_weight, 0.0)
         self.assertGreater(args.aux_cycle_weight, 0.0)
+        self.assertGreater(args.grad_clip, 0.0)
+        self.assertLess(args.rollout_residual_scale, 1.0)
+        self.assertTrue(args.detach_rollout_state)
 
     def test_explicit_stage_overrides_are_preserved_for_ablation(self):
         args = types.SimpleNamespace(
@@ -516,13 +601,21 @@ class CycleStateProtocolTest(unittest.TestCase):
             generator_only=True,
             gan_weight=0.0,
             aux_queue_weight=0.0,
+            aux_rollout_weight=2.5,
             aux_cycle_weight=0.0,
+            grad_clip=0.0,
+            rollout_residual_scale=0.75,
+            detach_rollout_state=False,
         )
         train.apply_stage_defaults(args)
         self.assertTrue(args.generator_only)
         self.assertEqual(0.0, args.gan_weight)
         self.assertEqual(0.0, args.aux_queue_weight)
+        self.assertEqual(2.5, args.aux_rollout_weight)
         self.assertEqual(0.0, args.aux_cycle_weight)
+        self.assertEqual(0.0, args.grad_clip)
+        self.assertEqual(0.75, args.rollout_residual_scale)
+        self.assertFalse(args.detach_rollout_state)
 
     def test_cyclestate_keeps_baseline_decoder_shapes_for_warm_start(self):
         baseline_model = models.TrajectoryGenerator(
@@ -699,6 +792,55 @@ class CycleStateProtocolTest(unittest.TestCase):
         )
         train.apply_stage_defaults(args)
         self.assertEqual(2.5, args.aux_rollout_weight)
+
+    def test_parser_defaults_train_validation_to_val_split(self):
+        args = train.parser.parse_args([])
+        self.assertEqual("val", args.val_dset_type)
+
+    def test_parser_supports_explicit_rollout_detach_override(self):
+        args = train.parser.parse_args(["--no_detach_rollout_state"])
+        train.apply_stage_defaults(args)
+        self.assertFalse(args.detach_rollout_state)
+
+    def test_validation_path_uses_configured_split(self):
+        args = types.SimpleNamespace(dataset_name="VTP_C", val_dset_type="val")
+        self.assertTrue(train.get_validation_dset_path(args).endswith("VTP_C/val"))
+        args.val_dset_type = "test"
+        self.assertTrue(train.get_validation_dset_path(args).endswith("VTP_C/test"))
+
+    def test_build_optimizers_uses_configured_learning_rate(self):
+        args = types.SimpleNamespace(lr=3e-4)
+        model = torch.nn.Linear(2, 2)
+        discriminator = torch.nn.Linear(2, 1)
+        optimizer, optimizer_d = train.build_optimizers(args, model, discriminator)
+        self.assertEqual(3e-4, optimizer.param_groups[0]["lr"])
+        self.assertEqual(3e-4, optimizer_d.param_groups[0]["lr"])
+
+    def test_extract_state_stability_metrics_reads_debug_norms(self):
+        debug = {
+            "decoder_state_init_residual_norm": torch.tensor([1.0, 3.0]),
+            "decoder_state_step_residual_norm_seq": torch.tensor(
+                [[2.0, 4.0], [6.0, 8.0]]
+            ),
+            "queue_rollout_hidden_seq": torch.tensor(
+                [[[3.0, 4.0]], [[0.0, 5.0]]]
+            ),
+        }
+        pred_offsets = torch.tensor([[[3.0, 4.0]], [[6.0, 8.0]]])
+
+        metrics = train.extract_state_stability_metrics(debug, pred_offsets)
+
+        self.assertAlmostEqual(2.0, metrics["decoder_state_init_residual_norm"])
+        self.assertAlmostEqual(5.0, metrics["decoder_state_step_residual_norm"])
+        self.assertAlmostEqual(5.0, metrics["queue_rollout_hidden_norm"])
+        self.assertAlmostEqual(7.5, metrics["pred_offset_norm"])
+
+    def test_evaluate_parser_exposes_rollout_stability_knobs(self):
+        args = evaluate_model.parser.parse_args(
+            ["--model_type", "cyclestate", "--rollout_residual_scale", "0.35", "--detach_rollout_state"]
+        )
+        self.assertEqual(0.35, args.rollout_residual_scale)
+        self.assertTrue(args.detach_rollout_state)
 
     def test_evaluate_model_supports_max_eval_batches_and_weighted_averaging(self):
         batch = [

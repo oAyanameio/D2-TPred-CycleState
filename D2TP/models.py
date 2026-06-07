@@ -847,6 +847,8 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         disable_queue_rollout=False,
         disable_lane_queue_anchor=False,
         disable_decoder_state_residual=False,
+        rollout_residual_scale=1.0,
+        detach_rollout_state=False,
     ):
         super(CycleStateTrajectoryGenerator, self).__init__(
             obs_len=obs_len,
@@ -891,6 +893,8 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         self.disable_queue_rollout = disable_queue_rollout
         self.disable_lane_queue_anchor = disable_lane_queue_anchor
         self.disable_decoder_state_residual = disable_decoder_state_residual
+        self.rollout_residual_scale = rollout_residual_scale
+        self.detach_rollout_state = detach_rollout_state
 
         self.queue_feature_embedding = nn.Sequential(
             nn.Linear(self.queue_feature_dim, self.queue_lstm_hidden_size),
@@ -1527,6 +1531,7 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
     ):
         """让 rollout queue context 以锚定残差方式进入 decoder。"""
         rollout_delta = rollout_queue_context - observed_queue_context
+        rollout_delta = torch.tanh(rollout_delta)
         rollout_gate = self.rollout_decode_context_gate(
             torch.cat(
                 (
@@ -1537,7 +1542,32 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                 dim=1,
             )
         )
-        return observed_queue_context + rollout_gate * rollout_delta
+        return (
+            observed_queue_context
+            + self.rollout_residual_scale * rollout_gate * rollout_delta
+        )
+
+    def maybe_detach_rollout_state(
+        self,
+        rollout_queue_feature,
+        rollout_lane_queue_anchor,
+        rollout_queue_h_t,
+        rollout_queue_c_t,
+    ):
+        """warmup 阶段截断预测期 meso rollout 跨步反传。"""
+        if not self.detach_rollout_state or not self.training:
+            return (
+                rollout_queue_feature,
+                rollout_lane_queue_anchor,
+                rollout_queue_h_t,
+                rollout_queue_c_t,
+            )
+        return (
+            rollout_queue_feature.detach(),
+            rollout_lane_queue_anchor.detach(),
+            rollout_queue_h_t.detach(),
+            rollout_queue_c_t.detach(),
+        )
 
     def forward(
         self,
@@ -1741,6 +1771,17 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                         light_state_embedding,
                     )
                     queue_decode_context_seq.append(queue_context_for_decode)
+                    (
+                        rollout_queue_feature,
+                        rollout_lane_queue_anchor,
+                        rollout_queue_h_t,
+                        rollout_queue_c_t,
+                    ) = self.maybe_detach_rollout_state(
+                        rollout_queue_feature,
+                        rollout_lane_queue_anchor,
+                        rollout_queue_h_t,
+                        rollout_queue_c_t,
+                    )
                 else:
                     queue_context_for_decode = gated_queue_last
                 if not self.disable_state_gating:
