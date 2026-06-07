@@ -87,9 +87,24 @@
 - Stage 25 P0 已完成并通过测试：
   - 已恢复 baseline/CycleState 中 `seqGAT` 的梯度流
   - 已修复 `relation_Matrix` 正常方向区间的无条件连边
-  - 当前单元测试增至 `38` 项并全部通过
+  - 当前单元测试增至 `39` 项并全部通过
+- Stage 25 true-val 复测结果：
+  - `warmup_p0_seqgat_relation_v1_50b`: `ADE 88.956 / FDE 175.380`
+  - `warmup_p0_seqgat_relation_v1_100b`: `ADE 204.730 / FDE 375.054`
+  - `100b` 相对 `50b` 仍恶化 `130.1%`，未通过 15% 稳定性门槛
+  - 但相较 Stage 24 的 `231.420 / 420.862`，P0 修复已把 `100b` 崩坏幅度压低
+- Stage 26 最小变量实验结果：
+  - 单独降低 warmup `teacher_forcing_ratio` 到 `0.6` 并不能解决问题：
+    - `warmup_p0_seqgat_relation_tf06_100b`
+    - `92.735 / 182.898 -> 266.671 / 468.079`
+    - `100b` 相对 `50b` 恶化 `187.6%`
+  - 但 `50b warmup -> 50b refine` 的阶段切换候选显著更稳：
+    - `warmup50_refine50_p0_seqgat_relation_v1`
+    - quick `val + num_samples=4`: `ADE 84.772 / FDE 170.878`
+    - full `val + num_samples=20`: `ADE 75.078 / FDE 154.690`
+  - 这说明“继续压 warmup teacher forcing”不是主因修复方向，更有价值的是在 `50b` 左右把长链状态学习交给 `refine` 接管。
 
-目前还不能宣称稳定超过 baseline 或论文指标。下一步从“修基础交互建模”切换到“用修复后的交互主干重跑 true-val 稳定性实验”，再判断是否还需要 exposure-bias 调整。
+目前还不能宣称稳定超过 baseline 或论文指标。到当前为止，最合理的科研叙事是：基础交互建模 bug 会放大崩坏，但 warmup 后半程失稳主要更像“训练阶段职责划分错误”，而不只是 exposure-bias；因此下一步主线应围绕 `50b warmup -> refine` 候选做正式复核和消融，而不是继续在 warmup 中堆新技巧。
 
 ## 复现入口
 
@@ -149,6 +164,44 @@ python D2TP/train.py \
 --no_detach_rollout_state
 ```
 
+### 当前最佳协议候选：`50b warmup -> 50b refine`
+
+```bash
+python D2TP/train.py \
+  --log_dir experiments/cyclestate/warmup50_refine50_p0_seqgat_relation_v1 \
+  --model_type cyclestate \
+  --train_stage refine \
+  --device cuda \
+  --pin_memory \
+  --loader_num_workers 0 \
+  --batch_size 8 \
+  --best_k 4 \
+  --num_val_samples 4 \
+  --aux_rollout_weight 2.5 \
+  --resume experiments/cyclestate/warmup_p0_seqgat_relation_v1_50b/checkpoint/model_best.pth.tar \
+  --num_epochs 0 \
+  --print_every 50 \
+  --max_train_batches 50 \
+  --max_val_batches 20 \
+  --val_dset_type val
+```
+
+完整 `val + num_samples=20` 复核：
+
+```bash
+python D2TP/evaluate_model.py \
+  --model_type cyclestate \
+  --device cuda \
+  --pin_memory \
+  --loader_num_workers 0 \
+  --batch_size 8 \
+  --num_samples 20 \
+  --eval_print_every 10 \
+  --resume experiments/cyclestate/warmup50_refine50_p0_seqgat_relation_v1/checkpoint/model_best.pth.tar \
+  --dset_type val \
+  --rollout_residual_scale 0.7
+```
+
 ## 下一轮实验顺序
 
 1. 补齐 baseline：`val/test` 各跑 `num_samples=4` 与 `20`。
@@ -157,23 +210,28 @@ python D2TP/train.py \
    - baseline/CycleState 的 `seqGAT` 已恢复可训练
    - `relation_Matrix` 方向扇区逻辑已修正
    - 对应梯度流/方向扇区测试已补齐
-4. 下一步直接跑：
-   - `warmup_p0_seqgat_relation_v1_50b`
-   - `warmup_p0_seqgat_relation_v1_100b`
+4. Stage 25 复测已经完成：
+   - `warmup_p0_seqgat_relation_v1_50b`: `88.956 / 175.380`
+   - `warmup_p0_seqgat_relation_v1_100b`: `204.730 / 375.054`
+   - 虽优于 Stage 24 的 `100b` 崩坏值，但仍未过门槛
 5. 快速筛选继续用 `val + num_samples=4`，入围后完整 `val + num_samples=20`。
 6. 稳定性门槛：
    - 同配置 `100-batch` 的 `val ADE` 不得比 `50-batch` 恶化超过 `15%`；
    - rollout-on 必须优于匹配的 no-rollout；
    - 通过后才进入 `refine`。
-7. 若 P0 修复后仍崩，再回到 exposure-bias 路线：
-   - 降低 `teacher_forcing_ratio`
-   - 或 50b warmup 后提前切到 `refine`
-8. 消融顺序：
+7. Stage 26 最小变量实验已经完成：
+   - warmup `teacher_forcing_ratio=0.6` 单独不成立，`100b` 更差
+   - `50b warmup -> refine` 已成为当前最佳协议候选
+8. 下一步优先级：
+   - 补齐 baseline `val/test + num_samples=20`
+   - 对 `warmup50_refine50_p0_seqgat_relation_v1` 做 `test + num_samples=20`
+   - 围绕该候选做 rollout on/off、decoder residual、lane anchor、state gating 消融
+9. 消融顺序：
    - rollout on/off
    - decoder residual on/off
    - lane anchor on/off
    - state gating on/off
-9. 只推进 1 个长程候选进入 `refine`，最后在 `test` split 上复核。
+10. 只推进 1 个长程候选进入最终 `test` 复核。
 
 ## 优化日志摘要
 
@@ -184,4 +242,5 @@ python D2TP/train.py \
 - Stage 15-19：Phase-Rolling Queue Memory、queue rollout 消融、Lane-Consensus Meso Anchor、predictive anchor trace、baseline-compatible decoder residual。
 - Stage 20-23：训练/评估指标口径对齐、验证调度修复、rollout 路径根因修复、matched warmup stability、`aux_rollout_weight` 独立调节。
 - Stage 24：协议优先稳定化，包含 true-val 选模、`lr` 生效、`grad_clip`、bounded rollout residual injection、warmup rollout-state detach 和状态稳定性日志。
-- Stage 25（计划中）：修复 `seqGAT` 梯度冻结与 `relation_Matrix` 方向约束 bug，再重跑 true-val 稳定性实验。
+- Stage 25：修复 `seqGAT` 梯度冻结与 `relation_Matrix` 方向约束 bug，并完成 true-val 复测；结果显示 `100b` 崩坏有所缓和，但仍未通过稳定性门槛。
+- Stage 26：最小变量稳定化复测；确认单独降低 warmup teacher forcing 无效，但 `50b warmup -> 50b refine` 在 quick `val` 与 full `val@20` 上均优于纯 warmup 候选。

@@ -685,6 +685,7 @@ class CycleStateProtocolTest(unittest.TestCase):
             aux_queue_weight=0.0,
             aux_rollout_weight=2.5,
             aux_cycle_weight=0.0,
+            teacher_forcing_ratio=0.6,
             grad_clip=0.0,
             rollout_residual_scale=0.75,
             detach_rollout_state=False,
@@ -695,6 +696,7 @@ class CycleStateProtocolTest(unittest.TestCase):
         self.assertEqual(0.0, args.aux_queue_weight)
         self.assertEqual(2.5, args.aux_rollout_weight)
         self.assertEqual(0.0, args.aux_cycle_weight)
+        self.assertEqual(0.6, args.teacher_forcing_ratio)
         self.assertEqual(0.0, args.grad_clip)
         self.assertEqual(0.75, args.rollout_residual_scale)
         self.assertFalse(args.detach_rollout_state)
@@ -883,6 +885,13 @@ class CycleStateProtocolTest(unittest.TestCase):
         args = train.parser.parse_args(["--no_detach_rollout_state"])
         train.apply_stage_defaults(args)
         self.assertFalse(args.detach_rollout_state)
+
+    def test_parser_supports_explicit_teacher_forcing_override(self):
+        args = train.parser.parse_args(
+            ["--model_type", "cyclestate", "--teacher_forcing_ratio", "0.6"]
+        )
+        train.apply_stage_defaults(args)
+        self.assertEqual(0.6, args.teacher_forcing_ratio)
 
     def test_validation_path_uses_configured_split(self):
         args = types.SimpleNamespace(dataset_name="VTP_C", val_dset_type="val")

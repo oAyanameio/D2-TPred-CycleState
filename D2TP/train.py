@@ -174,6 +174,12 @@ parser.add_argument(
     help="CycleState 的 cycle-state 辅助损失权重。",
 )
 parser.add_argument(
+    "--teacher_forcing_ratio",
+    default=None,
+    type=float,
+    help="显式覆盖当前训练阶段的 teacher forcing ratio，用于 protocol-check 或消融实验。",
+)
+parser.add_argument(
     "--disable_state_gating",
     action="store_true",
     help="关闭 phase-conditioned state modulation，用于 CycleState 的 gating 消融。",

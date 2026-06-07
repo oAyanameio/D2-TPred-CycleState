@@ -805,3 +805,184 @@
 - 若修复后 `100b` 仍明显崩坏，再进入：
   - 降低 `teacher_forcing_ratio`
   - 或 50b warmup 后提前切到 `refine`
+
+### Run
+- Name：`experiments/cyclestate/warmup_p0_seqgat_relation_v1_50b`
+- Tag：`protocol-check`
+- Split：`val`
+- num_samples：`4`
+- max_train_batches：`50`
+- max_val_batches：`20`
+- Key switches：
+  - `train_stage=warmup`
+  - `aux_rollout_weight=2.5`
+  - `grad_clip=1.0`
+  - `rollout_residual_scale=0.35`
+  - `detach_rollout_state=True`
+  - `teacher_forcing_ratio=0.8`
+- Command：
+  `python D2TP/train.py --log_dir experiments/cyclestate/warmup_p0_seqgat_relation_v1_50b --model_type cyclestate --train_stage warmup --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --best_k 4 --num_val_samples 4 --aux_rollout_weight 2.5 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 50 --max_train_batches 50 --max_val_batches 20 --val_dset_type val`
+- Best ADE：`88.956`
+- Best FDE：`175.380`
+- Stability notes：
+  - 初始 `StateStability`：
+    - `QRollHNorm 0.357446`
+    - `PredOffsetNorm 14.637169`
+    - `GradNorm 888.004456`
+  - 与 Stage 24 的 `50b` 结果 `87.082 / 175.723` 同量级。
+  - 说明 P0 修复没有破坏短程 warmup 起点。
+
+### Run
+- Name：`experiments/cyclestate/warmup_p0_seqgat_relation_v1_100b`
+- Tag：`protocol-check`
+- Split：`val`
+- num_samples：`4`
+- max_train_batches：`100`
+- max_val_batches：`20`
+- Key switches：
+  - `train_stage=warmup`
+  - `aux_rollout_weight=2.5`
+  - `grad_clip=1.0`
+  - `rollout_residual_scale=0.35`
+  - `detach_rollout_state=True`
+  - `teacher_forcing_ratio=0.8`
+- Command：
+  `python D2TP/train.py --log_dir experiments/cyclestate/warmup_p0_seqgat_relation_v1_100b --model_type cyclestate --train_stage warmup --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --best_k 4 --num_val_samples 4 --aux_rollout_weight 2.5 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 50 --max_train_batches 100 --max_val_batches 20 --val_dset_type val`
+- Checkpoints：
+  - `batch 50`: `ADE 88.956 / FDE 175.380`
+  - `batch 100`: `ADE 204.730 / FDE 375.054`
+- Stability notes：
+  - `batch 100` 相对 `batch 50` 恶化 `130.1%`
+  - 15% 稳定性阈值对应 `ADE <= 102.299`，当前未通过
+  - `batch 50` 稳定性指标：
+    - `DInitNorm 0.040298`
+    - `DStepNorm 0.038976`
+    - `QRollHNorm 3.010231`
+    - `PredOffsetNorm 8.338700`
+    - `GradNorm 2228.337402`
+  - 相比 Stage 24 的 `100b`：
+    - `ADE 231.420 -> 204.730`
+    - `FDE 420.862 -> 375.054`
+  - 说明 P0 修复缓和了崩坏，但没有从根本上解决 warmup 长链失稳。
+
+### Stage 25 Experimental Conclusion
+- `seqGAT` 梯度冻结与方向扇区失真确实是实质问题，修复后 `100b` 崩坏幅度有所收敛。
+- 但 true-val `100b` 仍较 `50b` 恶化 `130.1%`，远未通过稳定性门槛。
+- 因此 Stage 25 的结论不是“结构已稳定”，而是：
+  1. 基础交互建模 bug 会放大失稳
+  2. 但 warmup 后半程崩坏还有更深层的训练协议根因
+  3. 下一轮应收敛到最小变量的 exposure-bias/阶段切换实验，而不是继续加新模块
+
+### Recommended Next Runs
+1. `experiments/cyclestate/warmup_p0_seqgat_relation_tf06_100b`
+   - Tag：`protocol-check`
+   - Hypothesis：降低 warmup teacher forcing，减弱训练-推理分布偏移
+2. `experiments/cyclestate/warmup50_refine50_p0_seqgat_relation_v1`
+   - Tag：`protocol-check`
+   - Hypothesis：把长链状态耦合更早交给 refine，而不是在 warmup 中硬撑到 100b
+
+## Stage 26：最小变量稳定化复测
+### Code Change
+1. 新增显式协议开关：
+   - `train.py --teacher_forcing_ratio`
+   - 允许在不改阶段默认值的前提下做 protocol-check
+
+### Tests
+- 新增 parser/override 测试：
+  - `test_parser_supports_explicit_teacher_forcing_override`
+- 扩展阶段默认值覆盖测试，确认显式 `teacher_forcing_ratio` 不会被 stage default 覆盖
+- 当前协议测试总数：
+  - `39`
+  - 全部通过
+
+### Run
+- Name：`experiments/cyclestate/warmup_p0_seqgat_relation_tf06_100b`
+- Tag：`protocol-check`
+- Split：`val`
+- num_samples：`4`
+- max_train_batches：`100`
+- max_val_batches：`20`
+- Key switches：
+  - `train_stage=warmup`
+  - `teacher_forcing_ratio=0.6`
+  - `aux_rollout_weight=2.5`
+  - `grad_clip=1.0`
+  - `rollout_residual_scale=0.35`
+  - `detach_rollout_state=True`
+- Command：
+  `python D2TP/train.py --log_dir experiments/cyclestate/warmup_p0_seqgat_relation_tf06_100b --model_type cyclestate --train_stage warmup --teacher_forcing_ratio 0.6 --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --best_k 4 --num_val_samples 4 --aux_rollout_weight 2.5 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 50 --max_train_batches 100 --max_val_batches 20 --val_dset_type val`
+- Checkpoints：
+  - `batch 50`: `ADE 92.735 / FDE 182.898`
+  - `batch 100`: `ADE 266.671 / FDE 468.079`
+- Stability notes：
+  - `batch 50` 的梯度与状态范数更温和：
+    - `DInitNorm 0.063009`
+    - `DStepNorm 0.074012`
+    - `QRollHNorm 3.111946`
+    - `PredOffsetNorm 9.381316`
+    - `GradNorm 598.875000`
+  - 但 `batch 100` 相对 `batch 50` 仍恶化 `187.6%`
+  - 结论：单独降低 warmup teacher forcing 不能解决长链失稳，且最终指标更差。
+
+### Run
+- Name：`experiments/cyclestate/warmup50_refine50_p0_seqgat_relation_v1`
+- Tag：`protocol-check`
+- Split：`val`
+- num_samples：`4`
+- max_train_batches：`50`
+- max_val_batches：`20`
+- Key switches：
+  - `train_stage=refine`
+  - `resume=experiments/cyclestate/warmup_p0_seqgat_relation_v1_50b/checkpoint/model_best.pth.tar`
+  - `teacher_forcing_ratio=0.6`
+  - `aux_queue_weight=3.0`
+  - `aux_rollout_weight=2.5`
+  - `aux_cycle_weight=1.5`
+  - `rollout_residual_scale=0.7`
+  - `detach_rollout_state=False`
+- Command：
+  `python D2TP/train.py --log_dir experiments/cyclestate/warmup50_refine50_p0_seqgat_relation_v1 --model_type cyclestate --train_stage refine --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --best_k 4 --num_val_samples 4 --aux_rollout_weight 2.5 --resume experiments/cyclestate/warmup_p0_seqgat_relation_v1_50b/checkpoint/model_best.pth.tar --num_epochs 0 --print_every 50 --max_train_batches 50 --max_val_batches 20 --val_dset_type val`
+- Best ADE：`84.772`
+- Best FDE：`170.878`
+- Stability notes：
+  - 相比纯 warmup `50b` 候选 `88.956 / 175.380`：
+    - `ADE` 改善 `4.7%`
+    - `FDE` 改善 `2.6%`
+  - 结论：阶段切换比继续压 warmup 更有希望，是当前最优协议候选。
+
+### Run
+- Name：`experiments/cyclestate/warmup50_refine50_p0_seqgat_relation_v1`
+- Tag：`comparable`
+- Split：`val`
+- num_samples：`20`
+- resume：`experiments/cyclestate/warmup50_refine50_p0_seqgat_relation_v1/checkpoint/model_best.pth.tar`
+- Key switches：
+  - `model_type=cyclestate`
+  - `rollout_residual_scale=0.7`
+- Command：
+  `python D2TP/evaluate_model.py --model_type cyclestate --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --num_samples 20 --eval_print_every 10 --resume experiments/cyclestate/warmup50_refine50_p0_seqgat_relation_v1/checkpoint/model_best.pth.tar --dset_type val --rollout_residual_scale 0.7`
+- ADE：`75.078`
+- FDE：`154.690`
+- Interpretation：
+  - 这是当前 `CycleState` 最强的 true-val 证据。
+  - 仍明显高于仓库 baseline `val@20`/正式目标，因此还不能宣称超过 baseline。
+  - 但相较当前 quick protocol-check 候选，说明 `50b warmup -> refine` 方向值得进入正式 test 复核与消融。
+
+### Stage 26 Experimental Conclusion
+- 仅靠降低 warmup teacher forcing，不能修复长链失稳；它压低了梯度，却让 `100b` 最终指标更差。
+- 相反，把训练职责在 `50b` 左右从 warmup 切到 refine，能在不改结构的前提下显著改善 true-val。
+- 因此当前最佳科研主线应更新为：
+  1. 基础交互建模 bug 已修复
+  2. warmup 不宜承担过长的长链状态耦合训练
+  3. `50b warmup -> refine` 是当前最值得推进的协议候选
+
+### Recommended Next Runs
+1. `baseline_audit_v2_val_full_num_samples20`
+2. `baseline_audit_v2_test_full_num_samples20`
+3. `experiments/cyclestate/warmup50_refine50_p0_seqgat_relation_v1_test20`
+   - 对当前最佳候选做 `test + num_samples=20` 正式复核
+4. 基于该候选做消融：
+   - `disable_queue_rollout`
+   - `disable_decoder_state_residual`
+   - `disable_lane_queue_anchor`
+   - `disable_state_gating`
