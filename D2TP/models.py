@@ -967,6 +967,17 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
             ),
             nn.Sigmoid(),
         )
+        self.rollout_decode_context_gate = nn.Sequential(
+            nn.Linear(
+                self.light_embedding_size
+                + self.queue_lstm_hidden_size
+                + self.queue_lstm_hidden_size,
+                self.queue_lstm_hidden_size,
+            ),
+            nn.ReLU(),
+            nn.Linear(self.queue_lstm_hidden_size, self.queue_lstm_hidden_size),
+            nn.Sigmoid(),
+        )
         self.cycle_context_gate = nn.Sequential(
             nn.Linear(
                 self.light_embedding_size
@@ -1012,6 +1023,8 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         nn.init.zeros_(self.decoder_state_residual[2].bias)
         nn.init.zeros_(self.decoder_state_gate[2].weight)
         nn.init.constant_(self.decoder_state_gate[2].bias, -2.0)
+        nn.init.zeros_(self.rollout_decode_context_gate[2].weight)
+        nn.init.constant_(self.rollout_decode_context_gate[2].bias, -2.0)
         self.debug_last_aux = None
 
     def init_hidden_queue_lstm(self, batch):
@@ -1506,6 +1519,26 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         state_gate = self.decoder_state_gate(decoder_state_context)
         return state_gate * state_residual
 
+    def build_rollout_decode_queue_context(
+        self,
+        observed_queue_context,
+        rollout_queue_context,
+        light_state_embedding,
+    ):
+        """让 rollout queue context 以锚定残差方式进入 decoder。"""
+        rollout_delta = rollout_queue_context - observed_queue_context
+        rollout_gate = self.rollout_decode_context_gate(
+            torch.cat(
+                (
+                    light_state_embedding,
+                    observed_queue_context,
+                    rollout_queue_context,
+                ),
+                dim=1,
+            )
+        )
+        return observed_queue_context + rollout_gate * rollout_delta
+
     def forward(
         self,
         obs_traj_rel,
@@ -1643,11 +1676,13 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
 
         obs_traj_rel = obs_traj_rel[:, :, 2:4]
         output = obs_traj_rel[self.obs_len - 1]
+        last_rollout_offset = output
         queue_rollout_hidden_seq = []
         queue_rollout_feature_seq = []
         queue_rollout_pred_seq = []
         queue_rollout_target_seq = []
         lane_queue_rollout_anchor_seq = []
+        queue_decode_context_seq = []
         decoder_state_residual_seq = []
         rollout_queue_h_t = gated_queue_last
         rollout_queue_c_t = torch.zeros_like(gated_queue_last)
@@ -1681,7 +1716,7 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                         rollout_lane_ids,
                         seq_start_end,
                         current_cycle_feature,
-                        input_t.squeeze(0),
+                        last_rollout_offset,
                         i,
                         light_state_embedding,
                         cycle_step_embedding,
@@ -1700,7 +1735,12 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                     queue_rollout_hidden_seq.append(rollout_queue_h_t)
                     queue_rollout_pred_seq.append(rollout_info["queue_pred"])
                     queue_rollout_target_seq.append(rollout_info["queue_target"])
-                    queue_context_for_decode = rollout_queue_h_t
+                    queue_context_for_decode = self.build_rollout_decode_queue_context(
+                        gated_queue_last,
+                        rollout_queue_h_t,
+                        light_state_embedding,
+                    )
+                    queue_decode_context_seq.append(queue_context_for_decode)
                 else:
                     queue_context_for_decode = gated_queue_last
                 if not self.disable_state_gating:
@@ -1717,6 +1757,7 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                     decoder_state_residual_seq.append(step_state_residual)
                 pred_input = torch.cat((light_state_embedding, pred_lstm_hidden), dim=1)
                 output = self.pred_hidden2pos(pred_input)
+                last_rollout_offset = input_t.squeeze(0) if teacher_force else output
                 pred_traj_rel += [output]
         else:
             for i in range(self.pred_len):
@@ -1760,7 +1801,12 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                     queue_rollout_hidden_seq.append(rollout_queue_h_t)
                     queue_rollout_pred_seq.append(rollout_info["queue_pred"])
                     queue_rollout_target_seq.append(rollout_info["queue_target"])
-                    queue_context_for_decode = rollout_queue_h_t
+                    queue_context_for_decode = self.build_rollout_decode_queue_context(
+                        gated_queue_last,
+                        rollout_queue_h_t,
+                        light_state_embedding,
+                    )
+                    queue_decode_context_seq.append(queue_context_for_decode)
                 else:
                     queue_context_for_decode = gated_queue_last
                 if not self.disable_state_gating:
@@ -1777,6 +1823,7 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                     decoder_state_residual_seq.append(step_state_residual)
                 pred_input = torch.cat((light_state_embedding, pred_lstm_hidden), dim=1)
                 output = self.pred_hidden2pos(pred_input)
+                last_rollout_offset = output
                 pred_traj_rel += [output]
 
         if queue_rollout_hidden_seq:
@@ -1791,6 +1838,10 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
             )
             self.debug_last_aux["queue_rollout_target_seq"] = torch.stack(
                 queue_rollout_target_seq
+            )
+        if queue_decode_context_seq:
+            self.debug_last_aux["queue_decode_context_seq"] = torch.stack(
+                queue_decode_context_seq
             )
         if lane_queue_rollout_anchor_seq:
             self.debug_last_aux["lane_queue_rollout_anchor_seq"] = torch.stack(

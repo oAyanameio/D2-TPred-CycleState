@@ -213,6 +213,78 @@
 - 下一步优先级不是继续堆新模块，
   而是修正 rollout 的训练入口、监督强度和状态注入方式
 
+## 最新的重要 rollout 修复
+当前已经完成两处更具体的 rollout 路径修正：
+
+1. `training step-0 rollout alignment`
+   - 训练态 step 0 不再直接吃 teacher-forced future offset
+   - 现在改为与推理态一致，使用最后观测 offset 作为上一时刻已知运动
+2. `anchored rollout decode context`
+   - decoder 不再直接用 `rollout_queue_h_t` 整块替换 queue context
+   - 现在改为：
+     `observed queue context + gated rollout delta`
+
+这两点的直接动机是：
+- 让 training/inference 真正共享单步 meso rollout 逻辑
+- 让 rollout memory 以“锚定残差”方式调制 decoder，而不是早期短训时直接接管 decoder
+
+## 最新的重要结果更新
+修复后的短协议对照结果变成：
+
+- `warmup_main_v2_schedfix_rollfix_v2`（rollout on）：
+  - `ADE 66.793`
+  - `FDE 132.168`
+- 对照参考 `warmup_no_rollout_v2_schedfix`：
+  - `ADE 71.863`
+  - `FDE 140.974`
+
+当前启示更新为：
+- rollout 主线并没有 conceptually 失败
+- 一旦把训练态驱动与 decoder 注入方式修顺，
+  `rollout on` 已经重新超过 `no_rollout`
+- 下一步应继续沿 rollout 主线检查：
+  - 更长 warmup 下这种优势是否稳定
+  - rollout auxiliary supervision 是否仍然过强
+
+## 最新的重要 stability 结论
+当前已经完成更长的 matched warmup 检查：
+
+- 默认 rollout-on：
+  - `batch 50`: `71.978 / 135.287`
+  - `batch 100`: `185.583 / 322.389`
+- `no_rollout`：
+  - `batch 50`: `67.747 / 124.741`
+  - `batch 100`: `196.345 / 331.583`
+
+当前启示是：
+- 当前 warmup 在更长 short-run 训练上整体不稳
+- 默认 rollout-on 到 `batch 50` 仍然略输 `no_rollout`
+- 但到 `batch 100` 已经不是 rollout 单独崩，而是协议整体都在崩
+
+## 最新的重要 rollout-aux 结论
+当前已经把 rollout auxiliary supervision 从 queue aux 中拆成独立权重：
+
+- 新参数：`aux_rollout_weight`
+- 默认兼容旧行为：
+  - 若不显式指定，则等于 `aux_queue_weight`
+
+当前实验结论：
+- `aux_rollout_weight=2.5`
+  - `50-batch rollout-on`: `66.761 / 122.728`
+  - 优于 `no_rollout@50b`: `67.747 / 124.741`
+- `aux_rollout_weight=1.0`
+  - `batch 50`: `71.872 / 134.018`
+  - `batch 100`: `190.641 / 320.417`
+
+当前启示更新为：
+- rollout aux 的确不该继续和 `aux_queue_weight=10.0` 完全绑死
+- 但它也不能被简单砍到很低；
+  当前短程最佳点更接近 `2.5`，而不是 `1.0`
+- 下一步更应该考虑：
+  - 用 `aux_rollout_weight≈2.5` 作为短程最佳设置
+  - 缩短 warmup 或提早切 refine，
+    避免 `batch 100` 附近整体崩坏
+
 ## 最新的重要结构修正
 当前最新的重要修正是：
 

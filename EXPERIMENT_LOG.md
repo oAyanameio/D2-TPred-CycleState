@@ -510,3 +510,111 @@
     说明真正递推的 meso-state memory 还没有被当前 warmup 配方训顺。
   - 下一步应优先修正 rollout 注入与监督策略，
     而不是直接推进 `refine` 或重新引入 GAN。
+
+## Stage 22：Rollout 路径根因修复
+### Diagnosis
+- 根因 1：
+  - 训练态 rollout 在 step 0 使用了 teacher-forced future offset，
+    而推理态使用的是最后观测 offset。
+  - 这意味着训练态和推理态并没有共享同一套单步 meso-state 演化逻辑。
+- 根因 2：
+  - rollout 开启后，decoder 会直接使用 `rollout_queue_h_t`
+    作为 queue decode context。
+  - 对观测期 `gated_queue_last` 没有锚定，等价于让 rollout hidden
+    在 very-short warmup 下整块接管 meso context。
+
+### Code Fix
+- 训练态 step-0 rollout 现在改为：
+  - 使用最后观测 offset 作为上一时刻已知运动
+- decoder queue context 现在改为：
+  - `observed queue context + gated rollout delta`
+  - 不再直接用 `rollout_queue_h_t` 整块替换
+- 已新增对应回归测试：
+  - `test_training_rollout_step_zero_uses_last_observed_offset`
+  - `test_rollout_decode_context_is_anchored_to_observed_queue_state`
+
+### Run
+- Name：`experiments/cyclestate/warmup_main_v2_schedfix_rollfix_v2`
+- Tag：`protocol-check`
+- Command：
+  `python D2TP/train.py --log_dir experiments/cyclestate/warmup_main_v2_schedfix_rollfix_v2 --model_type cyclestate --train_stage warmup --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --best_k 4 --num_val_samples 4 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 20 --max_train_batches 20 --max_val_batches 20 --val_every 1`
+- Best ADE：`66.793`
+- Best FDE：`132.168`
+- Notes：
+  - 相比修复前的 `warmup_main_v2_schedfix`：
+    - ADE：`78.227 -> 66.793`
+    - FDE：`152.544 -> 132.168`
+  - 当前已经重新优于短协议 `no_rollout` 对照：
+    - `71.863 / 140.974`
+  - 这说明 rollout 主线的 scientific story 仍然成立，
+    之前的问题主要来自训练/注入路径，而不是 idea 本身失效。
+
+## Stage 23：Matched Warmup Stability 与 Rollout-Aux 独立调节
+### Run
+- Name：`experiments/cyclestate/warmup_main_v2_schedfix_rollfix_100b`
+- Tag：`protocol-check`
+- Command：
+  `python D2TP/train.py --log_dir experiments/cyclestate/warmup_main_v2_schedfix_rollfix_100b --model_type cyclestate --train_stage warmup --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --best_k 4 --num_val_samples 4 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 50 --max_train_batches 100 --max_val_batches 20 --val_every 1`
+- Checkpoints：
+  - `batch 50`: `ADE 71.978 / FDE 135.287`
+  - `batch 100`: `ADE 185.583 / FDE 322.389`
+- Notes：
+  - 默认 rollout-on 在更长 matched warmup 下，
+    到 `batch 50` 仍然略输 `no_rollout`
+  - 到 `batch 100` 时已经明显崩坏
+
+### Run
+- Name：`experiments/cyclestate/warmup_no_rollout_v2_schedfix_100b`
+- Tag：`protocol-check`
+- Command：
+  `python D2TP/train.py --log_dir experiments/cyclestate/warmup_no_rollout_v2_schedfix_100b --model_type cyclestate --train_stage warmup --disable_queue_rollout --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --best_k 4 --num_val_samples 4 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 50 --max_train_batches 100 --max_val_batches 20 --val_every 1`
+- Checkpoints：
+  - `batch 50`: `ADE 67.747 / FDE 124.741`
+  - `batch 100`: `ADE 196.345 / FDE 331.583`
+- Notes：
+  - `no_rollout` 在 `batch 50` 仍优于默认 rollout-on
+  - 但到 `batch 100` 同样崩坏，
+    说明当前 warmup 协议在更长短程训练上整体不稳
+
+### Code Change
+- 新增 `--aux_rollout_weight`
+- 默认行为：
+  - 若未显式指定，则 `aux_rollout_weight = aux_queue_weight`
+  - 即保持历史实验口径兼容
+- 目的：
+  - 允许单独削弱 rollout auxiliary supervision，
+    而不同时削弱观测期 queue-state supervision
+
+### Run
+- Name：`experiments/cyclestate/warmup_main_v2_schedfix_rollfix_aux025_50b`
+- Tag：`protocol-check`
+- Command：
+  `python D2TP/train.py --log_dir experiments/cyclestate/warmup_main_v2_schedfix_rollfix_aux025_50b --model_type cyclestate --train_stage warmup --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --best_k 4 --num_val_samples 4 --aux_rollout_weight 2.5 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 50 --max_train_batches 50 --max_val_batches 20 --val_every 1`
+- Best ADE：`66.761`
+- Best FDE：`122.728`
+- Notes：
+  - 这是当前最好的 `50-batch rollout-on` 结果
+  - 相比默认 rollout-on：
+    - `71.978 / 135.287 -> 66.761 / 122.728`
+  - 也重新优于 `no_rollout@50b`：
+    - `67.747 / 124.741`
+
+### Run
+- Name：`experiments/cyclestate/warmup_main_v2_schedfix_rollfix_aux010_100b`
+- Tag：`protocol-check`
+- Command：
+  `python D2TP/train.py --log_dir experiments/cyclestate/warmup_main_v2_schedfix_rollfix_aux010_100b --model_type cyclestate --train_stage warmup --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --best_k 4 --num_val_samples 4 --aux_rollout_weight 1.0 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 50 --max_train_batches 100 --max_val_batches 20 --val_every 1`
+- Checkpoints：
+  - `batch 50`: `ADE 71.872 / FDE 134.018`
+  - `batch 100`: `ADE 190.641 / FDE 320.417`
+- Notes：
+  - 把 rollout aux 直接降到 `1.0` 并没有改善 `batch 50` 结果，
+    反而明显差于 `2.5`
+  - 这说明 rollout aux 不能被简单粗暴砍得过低
+
+### Stage 23 Conclusion
+- 当前最合理的解释是：
+  1. rollout aux 确实需要从 `aux_queue_weight` 中独立出来
+  2. 当前短程最佳点更接近 `aux_rollout_weight=2.5`，而不是 `1.0`
+  3. 当前更大的问题已经从“rollout 是否有效”
+     转移到“warmup 在更长短程训练上整体不稳”

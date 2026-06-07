@@ -208,6 +208,90 @@ class CycleStateProtocolTest(unittest.TestCase):
         self.assertFalse(torch.allclose(recorded_inputs[1], base_queue_feature))
         self.assertFalse(torch.allclose(recorded_inputs[1], recorded_inputs[0]))
 
+    def test_training_rollout_step_zero_uses_last_observed_offset(self):
+        traffic_context = self.model.build_traffic_context(
+            self.obs_traj_rel,
+            self.obs_traj,
+            self.obs_state,
+            self.pred_state,
+            self.seq_start_end,
+        )
+        rollout_offsets = []
+        original_rollout = self.model.rollout_queue_features
+
+        def capture_rollout(prev_queue_feature, current_cycle_feature, last_pred_offset, step_index):
+            rollout_offsets.append((step_index, last_pred_offset.detach().clone()))
+            return original_rollout(
+                prev_queue_feature,
+                current_cycle_feature,
+                last_pred_offset,
+                step_index,
+            )
+
+        with mock.patch.object(
+            self.model,
+            "rollout_queue_features",
+            side_effect=capture_rollout,
+        ):
+            self.model.train()
+            self.model(
+                self.obs_traj_rel,
+                self.obs_traj,
+                self.obs_state,
+                self.pred_state,
+                self.seq_start_end,
+                teacher_forcing_ratio=1.0,
+                traffic_context=traffic_context,
+            )
+
+        self.assertGreaterEqual(len(rollout_offsets), 1)
+        self.assertEqual(0, rollout_offsets[0][0])
+        expected_last_observed_offset = self.obs_traj_rel[self.model.obs_len - 1, :, 2:4]
+        self.assertTrue(
+            torch.allclose(rollout_offsets[0][1], expected_last_observed_offset)
+        )
+
+    def test_rollout_decode_context_is_anchored_to_observed_queue_state(self):
+        traffic_context = self.model.build_traffic_context(
+            self.obs_traj_rel,
+            self.obs_traj,
+            self.obs_state,
+            self.pred_state,
+            self.seq_start_end,
+        )
+        recorded_queue_contexts = []
+        original_build_residual = self.model.build_decoder_state_residual
+
+        def capture_queue_context(light_state_embedding, queue_context, cycle_context):
+            recorded_queue_contexts.append(queue_context.detach().clone())
+            return original_build_residual(
+                light_state_embedding,
+                queue_context,
+                cycle_context,
+            )
+
+        with mock.patch.object(
+            self.model,
+            "build_decoder_state_residual",
+            side_effect=capture_queue_context,
+        ):
+            self.model(
+                self.obs_traj_rel,
+                self.obs_traj,
+                self.obs_state,
+                self.pred_state,
+                self.seq_start_end,
+                traffic_context=traffic_context,
+            )
+
+        observed_queue_context = self.model.debug_last_aux["queue_hidden_last"]
+        rollout_queue_context = self.model.debug_last_aux["queue_rollout_hidden_seq"][0]
+        step0_decode_context = recorded_queue_contexts[1]
+        self.assertFalse(torch.allclose(step0_decode_context, rollout_queue_context))
+        observed_distance = (step0_decode_context - observed_queue_context).norm(dim=1)
+        rollout_distance = (rollout_queue_context - observed_queue_context).norm(dim=1)
+        self.assertTrue(torch.all(observed_distance < rollout_distance))
+
     def test_lane_anchor_rollout_is_dynamic_after_first_step(self):
         traffic_context = self.model.build_traffic_context(
             self.obs_traj_rel,
@@ -379,8 +463,10 @@ class CycleStateProtocolTest(unittest.TestCase):
         expected_keys = {
             "queue_reg_loss",
             "queue_cls_loss",
+            "queue_main_loss",
             "queue_rollout_reg_loss",
             "queue_rollout_cls_loss",
+            "queue_rollout_loss",
             "cycle_phase_loss",
             "cycle_time_loss",
             "cycle_change_loss",
@@ -579,11 +665,40 @@ class CycleStateProtocolTest(unittest.TestCase):
             generator_only=None,
             gan_weight=None,
             aux_queue_weight=None,
+            aux_rollout_weight=None,
             aux_cycle_weight=None,
             num_val_samples=5,
         )
         train.apply_stage_defaults(args)
         self.assertEqual(5, args.num_val_samples)
+
+    def test_apply_stage_defaults_defaults_rollout_weight_to_queue_weight(self):
+        args = types.SimpleNamespace(
+            train_stage="warmup",
+            model_type="cyclestate",
+            generator_only=None,
+            gan_weight=None,
+            aux_queue_weight=None,
+            aux_rollout_weight=None,
+            aux_cycle_weight=None,
+            num_val_samples=4,
+        )
+        train.apply_stage_defaults(args)
+        self.assertEqual(args.aux_queue_weight, args.aux_rollout_weight)
+
+    def test_apply_stage_defaults_preserves_explicit_rollout_weight(self):
+        args = types.SimpleNamespace(
+            train_stage="warmup",
+            model_type="cyclestate",
+            generator_only=None,
+            gan_weight=None,
+            aux_queue_weight=None,
+            aux_rollout_weight=2.5,
+            aux_cycle_weight=None,
+            num_val_samples=4,
+        )
+        train.apply_stage_defaults(args)
+        self.assertEqual(2.5, args.aux_rollout_weight)
 
     def test_evaluate_model_supports_max_eval_batches_and_weighted_averaging(self):
         batch = [

@@ -156,6 +156,12 @@ parser.add_argument(
     help="CycleState 的 queue-state 辅助损失权重。",
 )
 parser.add_argument(
+    "--aux_rollout_weight",
+    default=None,
+    type=float,
+    help="CycleState 的 rollout queue-state 辅助损失权重。默认跟随 aux_queue_weight。",
+)
+parser.add_argument(
     "--aux_cycle_weight",
     default=None,
     type=float,
@@ -255,6 +261,8 @@ def apply_stage_defaults(args):
     for key, value in stage_defaults.items():
         if getattr(args, key, None) is None:
             setattr(args, key, value)
+    if getattr(args, "aux_rollout_weight", None) is None:
+        args.aux_rollout_weight = getattr(args, "aux_queue_weight", 0.0)
     return args
 
 
@@ -417,11 +425,14 @@ def compute_structured_aux_losses(
             cycle_pred_last[:, 5:6], cycle_target_last[:, 5:6]
         )
 
+    losses["queue_main_loss"] = (
+        losses["queue_reg_loss"] + losses["queue_cls_loss"]
+    )
+    losses["queue_rollout_loss"] = (
+        losses["queue_rollout_reg_loss"] + losses["queue_rollout_cls_loss"]
+    )
     losses["queue_total_loss"] = (
-        losses["queue_reg_loss"]
-        + losses["queue_cls_loss"]
-        + losses["queue_rollout_reg_loss"]
-        + losses["queue_rollout_cls_loss"]
+        losses["queue_main_loss"] + losses["queue_rollout_loss"]
     )
     losses["cycle_total_loss"] = (
         losses["cycle_phase_loss"]
@@ -716,12 +727,13 @@ def main(args):
     optimizer = optim.RMSprop(model.parameters(), lr=1e-3)
     optimizer_d = optim.RMSprop(Discriminator.parameters(), lr=1e-3)
     logging.info(
-        "Training protocol | model_type=%s stage=%s generator_only=%s gan_weight=%.3f aux_queue=%.3f aux_cycle=%.3f disable_state_gating=%s disable_queue_rollout=%s disable_lane_queue_anchor=%s disable_decoder_state_residual=%s teacher_forcing=%.3f",
+        "Training protocol | model_type=%s stage=%s generator_only=%s gan_weight=%.3f aux_queue=%.3f aux_rollout=%.3f aux_cycle=%.3f disable_state_gating=%s disable_queue_rollout=%s disable_lane_queue_anchor=%s disable_decoder_state_residual=%s teacher_forcing=%.3f",
         args.model_type,
         args.train_stage,
         args.generator_only,
         args.gan_weight,
         args.aux_queue_weight,
+        args.aux_rollout_weight,
         args.aux_cycle_weight,
         args.disable_state_gating,
         args.disable_queue_rollout,
@@ -920,7 +932,10 @@ def train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, trai
         queue_rollout_target_seq = None
         cycle_pred_last = None
         cycle_target_last = None
-        if args.aux_queue_weight > 0 and aux_info["queue_pred_last"] is not None:
+        if (
+            (args.aux_queue_weight > 0 or args.aux_rollout_weight > 0)
+            and aux_info["queue_pred_last"] is not None
+        ):
             queue_pred_last = aux_info["queue_pred_last"]
             queue_target_last = aux_info["queue_targets"][-1]
             queue_rollout_pred_seq = aux_info.get("queue_rollout_pred_seq")
@@ -937,7 +952,8 @@ def train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, trai
             queue_rollout_target_seq=queue_rollout_target_seq,
             device=predtrajgt.device,
         )
-    aux_queue_loss = aux_losses["queue_total_loss"]
+    aux_queue_main_loss = aux_losses["queue_main_loss"]
+    aux_queue_rollout_loss = aux_losses["queue_rollout_loss"]
     aux_cycle_loss = aux_losses["cycle_total_loss"]
     losses.update(L2_loss.item(), obs_traj.shape[1])
     g_losses.update(g_loss.item(),obs_traj.shape[1])
@@ -951,7 +967,8 @@ def train(args,lens, model,batch_idx,batch,Discriminator, optimizer, epoch, trai
     total_loss = (
         L2_loss
         + g_loss * args.gan_weight
-        + aux_queue_loss * args.aux_queue_weight
+        + aux_queue_main_loss * args.aux_queue_weight
+        + aux_queue_rollout_loss * args.aux_rollout_weight
         + aux_cycle_loss * args.aux_cycle_weight
     )
     total_loss.backward()

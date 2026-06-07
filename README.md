@@ -88,6 +88,31 @@
   - 这说明“真正递推的 queue rollout”在当前短程 warmup 设置下
     还没有兑现预期收益，
     下一步必须先修 rollout 路径本身，而不是急着进入 refine/GAN。
+- `experiments/cyclestate/warmup_main_v2_schedfix_rollfix_v2`
+  - 在补上两处 rollout 路径修正后，
+    主配置重新提升到 `ADE 66.793 / FDE 132.168`
+  - 它已经重新优于前一轮 `no_rollout` 对照的 `71.863 / 140.974`，
+    说明 scientific story 本身没有塌，
+    问题主要出在训练态 rollout 的驱动方式与 decoder 注入方式。
+- `100-batch matched warmup`
+  - 进一步拉长后的 matched warmup 说明：
+    当前默认 warmup 协议在 `batch 50` 附近还能比较，
+    但到 `batch 100` 左右整体会一起崩。
+  - 默认 rollout-on：
+    - `batch 50`: `71.978 / 135.287`
+    - `batch 100`: `185.583 / 322.389`
+  - `no_rollout`：
+    - `batch 50`: `67.747 / 124.741`
+    - `batch 100`: `196.345 / 331.583`
+  - 这说明问题已经不只是“rollout 路径本身”，
+    而是当前 warmup 协议在更长短程训练里整体不稳。
+- `rollout aux` 独立降权探测
+  - 新增 `aux_rollout_weight` 后，
+    `aux_rollout_weight=2.5` 的 `50-batch` rollout-on
+    达到 `66.761 / 122.728`，
+    重新优于 `no_rollout@50b` 的 `67.747 / 124.741`。
+  - `aux_rollout_weight=1.0` 反而退到 `71.872 / 134.018`，
+    说明 rollout aux 不能简单一刀砍得过低。
 
 # 当前状态总结
 ## 已完成
@@ -102,7 +127,10 @@
 
 ## 当前还没完成
 - 还没有做足够长的 `warmup/refine` 正式训练，当前大部分结论仍然来自短 smoke run。
-- 还没有在统一口径下证明 `rollout on` 稳定优于 `no_rollout`。
+- 已经在短协议下初步恢复 `rollout on > no_rollout`，
+  但还没有证明这种优势在更长 warmup / refine 中稳定存在。
+- 已确认 `aux_rollout_weight=2.5` 比默认更适合当前短程 warmup，
+  但还没有解决 `100-batch` 后半程整体崩坏的问题。
 - 还没有证明 `decoder residual` 在更长训练下稳定带来收益。
 - 还没有完成辅助状态预测质量的系统评估与可视化。
 - 还没有完成 INT2 数据接口的正式接入。
@@ -560,6 +588,72 @@
     所以当前最需要优化的不是叠新模块，
     而是把 rollout 的训练入口、监督强度和状态注入方式调顺。
 
+## Stage 22: Rollout Path Root-Cause Fix
+- 原因：
+  - 针对 `rollout on < no_rollout` 的异常现象做代码级排查后，
+    发现了两个具体失配点：
+  - 第一，训练态 rollout 在第 0 步直接使用 teacher-forced future offset，
+    而推理态使用的是最后观测到的历史 offset，
+    两者不是同一套单步状态演化逻辑。
+  - 第二，decoder 在 rollout 开启后会直接把 `rollout_queue_h_t`
+    整块替换为 queue decode context，
+    缺少对观测期 `gated_queue_last` 的锚定。
+- 改动：
+  - 训练态 step-0 rollout 现在改为与推理态一致，
+    使用最后观测 offset 作为上一时刻已知运动。
+  - rollout queue context 现在改为
+    `observed queue context + gated rollout delta` 的锚定残差注入，
+    不再把 rollout hidden 整块替换进 decoder。
+  - 为这两点都新增了回归测试。
+- 新证据：
+  - 修复前：
+    - `warmup_main_v2_schedfix`：`78.227 / 152.544`
+  - 修复后：
+    - `warmup_main_v2_schedfix_rollfix_v2`：`66.793 / 132.168`
+  - 对照参考：
+    - `warmup_no_rollout_v2_schedfix`：`71.863 / 140.974`
+- 当前解释：
+  - 这说明 rollout 主线并不是概念上无效，
+    而是之前的训练/注入路径把它训歪了。
+  - 当前 `rollout on` 已经重新优于 `no_rollout`，
+    所以下一步应该继续沿 rollout 主线微调监督强度和长程稳定性，
+    而不是退回静态 queue context。
+
+## Stage 23: Matched Warmup Stability And Rollout-Aux Decoupling
+- 原因：
+  - 在 `20-batch` 级别，rollout-on 已经重新优于 `no_rollout`，
+    但这还不足以证明优势稳定。
+  - 因此需要先做更长的 matched warmup，
+    再判断是否应该把 rollout aux 从 queue aux 中拆开调节。
+- 新证据 1：`100-batch matched warmup`
+  - `rollout on`：
+    - `batch 50`: `71.978 / 135.287`
+    - `batch 100`: `185.583 / 322.389`
+  - `no_rollout`：
+    - `batch 50`: `67.747 / 124.741`
+    - `batch 100`: `196.345 / 331.583`
+  - 解释：
+    - 默认 warmup 配方下，`rollout on` 到 `batch 50` 仍略输 `no_rollout`
+    - 到 `batch 100` 时两边都明显崩坏
+    - 说明当前更大的问题是：warmup 协议在更长短训上整体不稳
+- 新证据 2：`aux_rollout_weight` 独立探测
+  - 新增独立 `aux_rollout_weight`，默认仍兼容旧行为
+  - `aux_rollout_weight=2.5`：
+    - `50-batch rollout on`: `66.761 / 122.728`
+    - 已重新优于 `no_rollout@50b`: `67.747 / 124.741`
+  - `aux_rollout_weight=1.0`：
+    - `100-batch rollout on`: `batch 50` 为 `71.872 / 134.018`
+    - 比 `2.5` 明显更差
+- 当前解释：
+  - rollout aux 确实不该继续和 `aux_queue_weight=10.0` 完全绑死
+  - 但它也不能被简单粗暴降得太低；
+    当前最优短程点更像落在 `2.5` 左右，而不是 `1.0`
+  - 下一步的主要方向不再是继续往下砍 rollout aux，
+    而是：
+    1. 用 `aux_rollout_weight≈2.5` 作为当前短程最佳设置
+    2. 把 warmup 改成更短阶段，或提早切换到 refine，
+       避免在 `batch 100` 附近整体崩坏
+
 ### 新训练协议下的首批 Smoke 观察
 - `cyclestate + warmup + aux + gating`：
   - ADE `155.554`，FDE `298.113`
@@ -605,16 +699,16 @@ CUDA_VISIBLE_DEVICES=2 python D2TP/train.py \
 当前 `CycleState` 分支仍然是一个早期原型。下一步的主要优化方向包括：
 1. 以当前 `4-sample` baseline 全量结果为仓库内可比参考线，
    再继续补更接近论文口径的 `num_samples=20` 审计。
-2. 先修 rollout 主线，再谈 refine：
-   - 优先检查 rollout state injection 是否过强
-   - 优先检查 rollout auxiliary supervision 是否过早主导优化
-3. 在 rollout 重新稳定后，再做匹配短对照：
+2. 继续修 rollout 主线，再谈完整长程 refine：
+   - 当前短程最佳设置先采用 `aux_rollout_weight≈2.5`
+   - 优先检查“缩短 warmup / 提前 refine”能否解决 `batch 100` 附近整体崩坏
+3. 在 rollout 已恢复短程优势的基础上，再做匹配短对照：
    - `queue rollout on/off`
    - `lane anchor on/off`
    - `state gating on/off`
    - `decoder residual on/off`
-4. 只有当 `rollout on` 先在短协议下重新超过 `no_rollout`，
-   才值得进入更长的 `warmup/refine`。
+4. 只有当新的 staged protocol 能避免 `100-batch` 级别崩坏，
+   才值得继续扩大 warmup/refine 训练长度。
 5. 增加评估阶段的辅助状态预测质量分析与可视化。
 6. 只有在 `warmup/refine` 已证明稳定并且主配置优于匹配 baseline 时，
    才谨慎重新引入小权重 adversarial 训练。
