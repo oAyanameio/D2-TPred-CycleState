@@ -36,6 +36,7 @@
 - `D2TP/evaluate_model.py`：离线 `val/test` 评估，支持 `d2tpred` 与 `cyclestate`。
 - `tests/test_cyclestate_protocol.py`：协议、消融开关、rollout 路径和评估聚合的回归测试。
 - `EXPERIMENT_LOG.md`：完整优化日志和实验记录。
+- `docs/AI_EXPERIMENT_DELEGATION_GUIDE.md`：委托其他 AI 执行修改/实验/验证时的统一作战手册。
 
 当前 `CycleState` 已支持：
 
@@ -204,34 +205,87 @@ python D2TP/evaluate_model.py \
 
 ## 下一轮实验顺序
 
-1. 补齐 baseline：`val/test` 各跑 `num_samples=4` 与 `20`。
-2. 稳定性实验已经确认：默认 Stage 24 和 `lr=3e-4` 都未通过 100b 门槛。
-3. Stage 25 P0 已完成：
-   - baseline/CycleState 的 `seqGAT` 已恢复可训练
-   - `relation_Matrix` 方向扇区逻辑已修正
-   - 对应梯度流/方向扇区测试已补齐
-4. Stage 25 复测已经完成：
-   - `warmup_p0_seqgat_relation_v1_50b`: `88.956 / 175.380`
-   - `warmup_p0_seqgat_relation_v1_100b`: `204.730 / 375.054`
-   - 虽优于 Stage 24 的 `100b` 崩坏值，但仍未过门槛
-5. 快速筛选继续用 `val + num_samples=4`，入围后完整 `val + num_samples=20`。
-6. 稳定性门槛：
-   - 同配置 `100-batch` 的 `val ADE` 不得比 `50-batch` 恶化超过 `15%`；
-   - rollout-on 必须优于匹配的 no-rollout；
-   - 通过后才进入 `refine`。
-7. Stage 26 最小变量实验已经完成：
-   - warmup `teacher_forcing_ratio=0.6` 单独不成立，`100b` 更差
-   - `50b warmup -> refine` 已成为当前最佳协议候选
-8. 下一步优先级：
-   - 补齐 baseline `val/test + num_samples=20`
-   - 对 `warmup50_refine50_p0_seqgat_relation_v1` 做 `test + num_samples=20`
-   - 围绕该候选做 rollout on/off、decoder residual、lane anchor、state gating 消融
-9. 消融顺序：
-   - rollout on/off
-   - decoder residual on/off
-   - lane anchor on/off
-   - state gating on/off
-10. 只推进 1 个长程候选进入最终 `test` 复核。
+1. 先补齐 baseline 的正式可比线：
+   - `baseline_audit_v2_val_full_num_samples20`
+   - `baseline_audit_v2_test_full_num_samples20`
+2. 再对当前最佳候选做正式复核：
+   - `warmup50_refine50_p0_seqgat_relation_v1_test20`
+   - 目标是确认 `50b warmup -> 50b refine` 在 `test + num_samples=20` 上是否仍优于纯 warmup 候选
+3. 若 `test@20` 结果仍站得住，再围绕该候选做消融：
+   - `disable_queue_rollout`
+   - `disable_decoder_state_residual`
+   - `disable_lane_queue_anchor`
+   - `disable_state_gating`
+4. 若 `test@20` 明显退化，再回到协议层而不是加结构：
+   - 优先检查 `rollout offset` 一致性、`phase_change` 预测期缺失、`D_step` 重置
+   - 暂不继续尝试 warmup `teacher_forcing_ratio` 单变量，因为 `tf=0.6` 已被证伪
+
+### 下一轮将直接执行的命令
+
+1. baseline `val + num_samples=20`
+
+```bash
+python D2TP/evaluate_model.py \
+  --model_type d2tpred \
+  --device cuda \
+  --pin_memory \
+  --loader_num_workers 0 \
+  --batch_size 16 \
+  --num_samples 20 \
+  --eval_print_every 10 \
+  --resume D2TP/model_best.pth.tar \
+  --dset_type val
+```
+
+2. baseline `test + num_samples=20`
+
+```bash
+python D2TP/evaluate_model.py \
+  --model_type d2tpred \
+  --device cuda \
+  --pin_memory \
+  --loader_num_workers 0 \
+  --batch_size 16 \
+  --num_samples 20 \
+  --eval_print_every 10 \
+  --resume D2TP/model_best.pth.tar \
+  --dset_type test
+```
+
+3. current best candidate `test + num_samples=20`
+
+```bash
+python D2TP/evaluate_model.py \
+  --model_type cyclestate \
+  --device cuda \
+  --pin_memory \
+  --loader_num_workers 0 \
+  --batch_size 8 \
+  --num_samples 20 \
+  --eval_print_every 10 \
+  --resume experiments/cyclestate/warmup50_refine50_p0_seqgat_relation_v1/checkpoint/model_best.pth.tar \
+  --dset_type test \
+  --rollout_residual_scale 0.7
+```
+
+### 进入下一步的判定标准
+
+- 若 `warmup50_refine50_p0_seqgat_relation_v1_test20` 相比纯 warmup 候选仍保持优势，则继续做消融，不改结构。
+- 若该候选在 `test@20` 上明显失去优势，则下一轮优先修正协议正确性项，而不是继续试新的训练 trick。
+
+### 委托其他 AI 的执行规范
+
+若后续把实验委托给其他 AI 执行，统一按：
+
+- [docs/AI_EXPERIMENT_DELEGATION_GUIDE.md](./docs/AI_EXPERIMENT_DELEGATION_GUIDE.md)
+
+它定义了：
+
+- 允许做什么 / 禁止做什么
+- 固定实验顺序
+- 必跑验证命令
+- 交付模板
+- 必须停下来交给主审的条件
 
 ## 优化日志摘要
 
