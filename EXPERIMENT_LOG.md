@@ -706,3 +706,102 @@
   - `100-batch` 的 true-val ADE 不得比 `50-batch` 恶化超过 `15%`
   - rollout-on 仍需优于匹配 no-rollout
   - 通过后再进入 `refine`
+
+### Run
+- Name：`experiments/cyclestate/warmup_protocol_stable_v1_50b`
+- Tag：`protocol-check`
+- Command：
+  `python D2TP/train.py --log_dir experiments/cyclestate/warmup_protocol_stable_v1_50b --model_type cyclestate --train_stage warmup --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --best_k 4 --num_val_samples 4 --aux_rollout_weight 2.5 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 50 --max_train_batches 50 --max_val_batches 20 --val_dset_type val`
+- Best ADE：`87.082`
+- Best FDE：`175.723`
+- Stability notes：
+  - true-val 协议、`lr=1e-3`、`grad_clip=1.0`、`rollout_residual_scale=0.35`
+  - 初始 `StateStability`：
+    - `QRollHNorm 0.357492`
+    - `PredOffsetNorm 14.647298`
+    - `GradNorm 631.850952`
+  - 与此前使用 test split 的短结果不能直接比较；这是 Stage 24 的 true-val 起点。
+
+### Run
+- Name：`experiments/cyclestate/warmup_protocol_stable_v1_100b`
+- Tag：`protocol-check`
+- Command：
+  `python D2TP/train.py --log_dir experiments/cyclestate/warmup_protocol_stable_v1_100b --model_type cyclestate --train_stage warmup --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --best_k 4 --num_val_samples 4 --aux_rollout_weight 2.5 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 50 --max_train_batches 100 --max_val_batches 20 --val_dset_type val`
+- Checkpoints：
+  - `batch 50`: `ADE 87.082 / FDE 175.723`
+  - `batch 100`: `ADE 231.420 / FDE 420.862`
+- Stability notes：
+  - `batch 100` 相对 `batch 50` 恶化 `165.7%`
+  - 15% 稳定性阈值对应 `ADE <= 100.144`，当前未通过
+  - `batch 50` 稳定性指标：
+    - `DInitNorm 0.033967`
+    - `DStepNorm 0.037403`
+    - `QRollHNorm 3.211943`
+    - `PredOffsetNorm 8.711025`
+    - `GradNorm 2165.728516`
+  - 结论：Stage 24 默认稳定化没有解决 true-val 100b 崩坏。
+
+### Run
+- Name：`experiments/cyclestate/warmup_protocol_stable_v1_lr0003_100b`
+- Tag：`protocol-check`
+- Command：
+  `python D2TP/train.py --log_dir experiments/cyclestate/warmup_protocol_stable_v1_lr0003_100b --model_type cyclestate --train_stage warmup --lr 0.0003 --device cuda --pin_memory --loader_num_workers 0 --batch_size 8 --best_k 4 --num_val_samples 4 --aux_rollout_weight 2.5 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 50 --max_train_batches 100 --max_val_batches 20 --val_dset_type val`
+- Checkpoints：
+  - `batch 50`: `ADE 88.598 / FDE 171.890`
+  - `batch 100`: `ADE 226.302 / FDE 411.163`
+- Stability notes：
+  - 降低学习率后，`batch 50` 的状态范数更温和：
+    - `QRollHNorm 0.927990`
+    - `PredOffsetNorm 10.118897`
+    - `GradNorm 1167.409912`
+  - 但 `batch 100` 仍明显崩坏，说明单纯降低学习率不足以解决问题。
+
+### Stage 24 Experimental Conclusion
+- true-val 口径比历史 test-split protocol-check 更严格，当前 `50b` 指标回到 `ADE 87-89` 区间。
+- 默认稳定化与 `lr=3e-4` 都未通过 `100b` 稳定性门槛。
+- 进一步代码审查显示，当前不宜立刻把下一步收敛为 exposure-bias 调参；有两个更基础的高优先级问题需要先修：
+  1. `seqGAT` 前向被 `torch.no_grad()` 包裹，局部时序图注意力参数实际不参与训练
+  2. `relation_Matrix` 在正常方向区间下会把距离内邻居无条件连边，方向扇区约束失真
+
+## Stage 25：基础交互建模 P0 修复
+### Code Change
+1. 恢复 `seqGAT` 可训练
+   - 已移除 `TrajectoryGenerator` 与 `CycleStateTrajectoryGenerator`
+     中 `seqgatencoder` 外层的 `torch.no_grad()`
+2. 修复 `relation_Matrix` 方向扇区 bug
+   - 已将正常区间 `else` 分支改为
+     `down <= dire_n_neig <= up`
+   - 不再对距离内邻居无条件设边
+
+### Tests
+- 新增梯度流测试：
+  - `test_seqgat_parameters_receive_gradients_in_baseline_generator`
+  - `test_seqgat_parameters_receive_gradients_in_cyclestate_generator`
+- 新增方向扇区测试：
+  - `test_relation_matrix_respects_direction_sector_in_normal_range`
+- 当前协议测试总数：
+  - `38`
+  - 全部通过
+
+### Smoke Verification
+- Name：`quick_runs/stage25_p0_cpu_smoke`
+- Tag：`smoke`
+- Command：
+  `python D2TP/train.py --log_dir quick_runs/stage25_p0_cpu_smoke --model_type cyclestate --train_stage warmup --device cpu --loader_num_workers 0 --batch_size 2 --best_k 1 --num_val_samples 1 --resume D2TP/model_best.pth.tar --num_epochs 0 --print_every 1 --max_train_batches 1 --max_val_batches 1`
+- Result：
+  - `ADE 39.382 / FDE 70.956`
+  - 训练、验证、checkpoint、`StateStability` 日志均正常
+
+### P1 Follow-ups
+1. `randn init -> zero init` 受控实验
+2. GAN label smoothing 修复
+
+### Updated Next Runs
+1. `experiments/cyclestate/warmup_p0_seqgat_relation_v1_50b`
+2. `experiments/cyclestate/warmup_p0_seqgat_relation_v1_100b`
+
+### Updated Decision Rule
+- Stage 25 的 P0 修复已完成，下一步直接回到 true-val 稳定性复测。
+- 若修复后 `100b` 仍明显崩坏，再进入：
+  - 降低 `teacher_forcing_ratio`
+  - 或 50b warmup 后提前切到 `refine`

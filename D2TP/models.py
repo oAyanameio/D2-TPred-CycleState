@@ -392,7 +392,7 @@ class GATEncoder(nn.Module):
                         elif 62 <= up <= 124:
                             if (down + 360 <= dire_n_neig <= 360) or (0 <= dire_n_neig <= up):
                                 r[cur_f, cur_n, n_neig] = 1
-                        else:
+                        elif down <= dire_n_neig <= up:
                             r[cur_f, cur_n, n_neig] = 1
         r = torch.tensor(r, dtype=torch.float32, device=curr_dire.device)
         return r
@@ -727,18 +727,17 @@ class TrajectoryGenerator(nn.Module):
         staend = torch.zeros((1, 2), dtype=torch.int, device=obs_traj_rel.device)
 
         # 3) 对局部时间窗口内的 GAT 输出再做一次序列聚合。
-        with torch.no_grad():
-            for j in range(self.obs_len):
-                if j <= kl:
-                    staend[0, 1] = j + 1
-                    graph_inter_input = self.seqgatencoder(graph_lstm_input[0:(j + 1)].permute(1, 0, 2), staend)
-                else:
-                    staend[0, 1] = kl + 1
-                    graph_inter_input = self.seqgatencoder(graph_lstm_input[(j - kl):(j + 1)].permute(1, 0, 2),
-                                                           staend)
-                # 只取当前窗口最后一个时间位置的表示，视为“截至第 j 帧”的
-                # 图交互上下文摘要。
-                graph_lstm_hidden_states += [graph_inter_input[:, -1, :]]
+        for j in range(self.obs_len):
+            if j <= kl:
+                staend[0, 1] = j + 1
+                graph_inter_input = self.seqgatencoder(graph_lstm_input[0:(j + 1)].permute(1, 0, 2), staend)
+            else:
+                staend[0, 1] = kl + 1
+                graph_inter_input = self.seqgatencoder(graph_lstm_input[(j - kl):(j + 1)].permute(1, 0, 2),
+                                                       staend)
+            # 只取当前窗口最后一个时间位置的表示，视为“截至第 j 帧”的
+            # 图交互上下文摘要。
+            graph_lstm_hidden_states += [graph_inter_input[:, -1, :]]
 
         # 4) 取最后一帧的交通灯状态，与运动特征拼接。
         light_state = self.get_last_state(obs_traj_pos, obs_state)
@@ -1633,20 +1632,19 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
             torch.stack(traj_lstm_hidden_states), seq_start_end, obs_dire
         )
         staend = torch.zeros((1, 2), dtype=torch.int, device=obs_traj_rel.device)
-        with torch.no_grad():
-            for j in range(self.obs_len):
-                if j <= 6:
-                    staend[0, 1] = j + 1
-                    graph_inter_input = self.seqgatencoder(
-                        graph_lstm_input[0 : (j + 1)].permute(1, 0, 2), staend
-                    )
-                else:
-                    staend[0, 1] = 7
-                    graph_inter_input = self.seqgatencoder(
-                        graph_lstm_input[(j - 6) : (j + 1)].permute(1, 0, 2),
-                        staend,
-                    )
-                graph_lstm_hidden_states += [graph_inter_input[:, -1, :]]
+        for j in range(self.obs_len):
+            if j <= 6:
+                staend[0, 1] = j + 1
+                graph_inter_input = self.seqgatencoder(
+                    graph_lstm_input[0 : (j + 1)].permute(1, 0, 2), staend
+                )
+            else:
+                staend[0, 1] = 7
+                graph_inter_input = self.seqgatencoder(
+                    graph_lstm_input[(j - 6) : (j + 1)].permute(1, 0, 2),
+                    staend,
+                )
+            graph_lstm_hidden_states += [graph_inter_input[:, -1, :]]
 
         for t in range(self.obs_len):
             queue_embed = self.queue_feature_embedding(queue_feature_seq[t])

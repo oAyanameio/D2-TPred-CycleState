@@ -168,6 +168,88 @@ class CycleStateProtocolTest(unittest.TestCase):
         self.assertTrue(torch.allclose(lane_anchor_rollout[0, 0], lane_anchor_rollout[0, 1]))
         self.assertFalse(torch.allclose(lane_anchor_rollout[0, 0], lane_anchor_rollout[0, 2]))
 
+    def test_seqgat_parameters_receive_gradients_in_baseline_generator(self):
+        baseline_model = models.TrajectoryGenerator(
+            obs_len=8,
+            pred_len=12,
+            traj_lstm_input_size=2,
+            traj_lstm_hidden_size=32,
+            n_units=[32, 16, 32],
+            n_heads=[4, 1],
+            graph_network_out_dims=32,
+            dropout=0.0,
+            alpha=0.2,
+            graph_lstm_hidden_size=32,
+            noise_dim=(16,),
+            noise_type="gaussian",
+        )
+        baseline_model.train()
+        baseline_model.zero_grad()
+
+        outputs = baseline_model(
+            self.obs_traj_rel,
+            self.obs_traj,
+            self.obs_state,
+            self.pred_state,
+            self.seq_start_end,
+            teacher_forcing_ratio=1.0,
+        )
+        loss = outputs.sum()
+        loss.backward()
+
+        grad_norm = 0.0
+        for name, param in baseline_model.seqgatencoder.named_parameters():
+            if param.grad is not None:
+                grad_norm += float(param.grad.abs().sum().item())
+        self.assertGreater(
+            grad_norm,
+            0.0,
+            "seqGAT encoder parameters should receive gradients during baseline training",
+        )
+
+    def test_seqgat_parameters_receive_gradients_in_cyclestate_generator(self):
+        self.model.train()
+        self.model.zero_grad()
+
+        outputs = self.model(
+            self.obs_traj_rel,
+            self.obs_traj,
+            self.obs_state,
+            self.pred_state,
+            self.seq_start_end,
+            teacher_forcing_ratio=1.0,
+        )
+        loss = outputs.sum()
+        loss.backward()
+
+        grad_norm = 0.0
+        for name, param in self.model.seqgatencoder.named_parameters():
+            if param.grad is not None:
+                grad_norm += float(param.grad.abs().sum().item())
+        self.assertGreater(
+            grad_norm,
+            0.0,
+            "seqGAT encoder parameters should receive gradients during CycleState training",
+        )
+
+    def test_relation_matrix_respects_direction_sector_in_normal_range(self):
+        encoder = models.GATEncoder(n_units=[32, 16, 32], n_heads=[4, 1], dropout=0.0, alpha=0.2)
+        curr_dire = torch.zeros(1, 3, 6, dtype=torch.float32)
+        # agent 0: heading 100 deg -> valid forward sector [38, 162]
+        curr_dire[0, 0, 2:4] = torch.tensor([0.0, 0.0])
+        curr_dire[0, 0, 5] = 100.0
+        # neighbor 1: inside sector, distance small
+        curr_dire[0, 1, 2:4] = torch.tensor([1.0, 1.0])  # 45 deg
+        curr_dire[0, 1, 5] = 0.0
+        # neighbor 2: outside sector, distance small
+        curr_dire[0, 2, 2:4] = torch.tensor([1.0, -1.0])  # 315 deg
+        curr_dire[0, 2, 5] = 0.0
+
+        relation = encoder.relation_Matrix(curr_dire)
+
+        self.assertEqual(1.0, relation[0, 0, 1].item())
+        self.assertEqual(0.0, relation[0, 0, 2].item())
+
     def test_queue_rollout_uses_previous_step_state(self):
         traffic_context = self.model.build_traffic_context(
             self.obs_traj_rel,

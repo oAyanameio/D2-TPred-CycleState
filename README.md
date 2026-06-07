@@ -75,8 +75,21 @@
 - 修复 training step-0 rollout alignment 与 anchored rollout decode context 后，rollout-on 恢复到 `66.793 / 132.168`，重新优于对应 no-rollout。
 - `aux_rollout_weight=2.5` 的 50-batch rollout-on 达到 `66.761 / 122.728`，优于 `no_rollout@50b` 的 `67.747 / 124.741`。
 - 100-batch matched warmup 曾出现后半程整体崩坏，因此当前优先级是协议稳定化，而不是继续堆新结构。
+- Stage 24 true-val 复核显示默认稳定化仍未通过：
+  - `warmup_protocol_stable_v1_50b`: `ADE 87.082 / FDE 175.723`
+  - `warmup_protocol_stable_v1_100b`: `ADE 231.420 / FDE 420.862`
+  - `100b` 相对 `50b` 恶化 `165.7%`，超过 15% 稳定性门槛
+- 单变量降低学习率到 `3e-4` 后，`batch 50` 状态范数更温和，但 `batch 100` 仍崩：
+  - `88.598 / 171.890 -> 226.302 / 411.163`
+- 对当前代码进一步审查后，已确认两个更基础的高优先级问题：
+  - `seqGAT` 前向被 `torch.no_grad()` 包裹，局部时序图注意力实际上不参与训练
+  - `relation_Matrix` 的正常方向区间分支会把距离内邻居无条件连边，削弱了方向约束
+- Stage 25 P0 已完成并通过测试：
+  - 已恢复 baseline/CycleState 中 `seqGAT` 的梯度流
+  - 已修复 `relation_Matrix` 正常方向区间的无条件连边
+  - 当前单元测试增至 `38` 项并全部通过
 
-目前还不能宣称稳定超过 baseline 或论文指标。下一步必须先在 true-val 协议下证明 100/200 batch 稳定，再推进 refine 和 test 复核。
+目前还不能宣称稳定超过 baseline 或论文指标。下一步从“修基础交互建模”切换到“用修复后的交互主干重跑 true-val 稳定性实验”，再判断是否还需要 exposure-bias 调整。
 
 ## 复现入口
 
@@ -139,21 +152,28 @@ python D2TP/train.py \
 ## 下一轮实验顺序
 
 1. 补齐 baseline：`val/test` 各跑 `num_samples=4` 与 `20`。
-2. 稳定性梯度实验：
-   - 当前参考：`rollfix + aux_rollout_weight=2.5`
-   - 协议硬化：`true-val + lr 生效 + grad_clip`
-   - 状态注入稳定化：`rollout_residual_scale + detach_rollout_state`
-3. 每组按 `50 -> 100 -> 200 batch` 递进；快速筛选用 `val + num_samples=4`，入围后完整 `val + num_samples=20`。
-4. 稳定性门槛：
+2. 稳定性实验已经确认：默认 Stage 24 和 `lr=3e-4` 都未通过 100b 门槛。
+3. Stage 25 P0 已完成：
+   - baseline/CycleState 的 `seqGAT` 已恢复可训练
+   - `relation_Matrix` 方向扇区逻辑已修正
+   - 对应梯度流/方向扇区测试已补齐
+4. 下一步直接跑：
+   - `warmup_p0_seqgat_relation_v1_50b`
+   - `warmup_p0_seqgat_relation_v1_100b`
+5. 快速筛选继续用 `val + num_samples=4`，入围后完整 `val + num_samples=20`。
+6. 稳定性门槛：
    - 同配置 `100-batch` 的 `val ADE` 不得比 `50-batch` 恶化超过 `15%`；
    - rollout-on 必须优于匹配的 no-rollout；
    - 通过后才进入 `refine`。
-5. 消融顺序：
+7. 若 P0 修复后仍崩，再回到 exposure-bias 路线：
+   - 降低 `teacher_forcing_ratio`
+   - 或 50b warmup 后提前切到 `refine`
+8. 消融顺序：
    - rollout on/off
    - decoder residual on/off
    - lane anchor on/off
    - state gating on/off
-6. 只推进 1 个长程候选进入 `refine`，最后在 `test` split 上复核。
+9. 只推进 1 个长程候选进入 `refine`，最后在 `test` split 上复核。
 
 ## 优化日志摘要
 
@@ -164,3 +184,4 @@ python D2TP/train.py \
 - Stage 15-19：Phase-Rolling Queue Memory、queue rollout 消融、Lane-Consensus Meso Anchor、predictive anchor trace、baseline-compatible decoder residual。
 - Stage 20-23：训练/评估指标口径对齐、验证调度修复、rollout 路径根因修复、matched warmup stability、`aux_rollout_weight` 独立调节。
 - Stage 24：协议优先稳定化，包含 true-val 选模、`lr` 生效、`grad_clip`、bounded rollout residual injection、warmup rollout-state detach 和状态稳定性日志。
+- Stage 25（计划中）：修复 `seqGAT` 梯度冻结与 `relation_Matrix` 方向约束 bug，再重跑 true-val 稳定性实验。
