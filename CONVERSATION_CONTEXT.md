@@ -74,8 +74,8 @@
 ### 5. Auxiliary supervision 升级
 早期的辅助监督版本是直接监督 hidden state 切片。
 这部分已经被升级为：
-- `queue_aux_head`
-- `cycle_aux_head`
+- `queue_aux_reg_head` + `queue_aux_cls_head`
+- `cycle_aux_phase_head` + `cycle_aux_time_head` + `cycle_aux_change_head`
 
 现在 queue/cycle 分支会显式预测辅助状态目标。
 

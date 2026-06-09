@@ -9,16 +9,130 @@ Under Traffic Lights。模型的核心思想是把车辆轨迹预测拆成三类
 生成器负责输出未来相对位移，判别器负责区分真实轨迹和生成轨迹。
 """
 
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import random
+
 # from scipy import stats
 from utils import relative_to_abs
 import math
 import numpy as np
 import time
+from dataclasses import dataclass
 from scipy.spatial.distance import pdist, squareform
+
+
+@dataclass(frozen=True)
+class RolloutQueueCoefs:
+    """Phase 3 #16:``rollout_queue_features`` 物理系数集中配置。
+
+    这些系数原本以裸字面量形式直接出现在 ``CycleStateTrajectoryGenerator.rollout_queue_features``
+    方法体内（如 ``0.08``、``0.10``、``0.12``、``0.14``、``0.6``、``0.4``、``0.5``、``1.5`` 等），
+    既不可从外部调参，也无法在不阅读源码的情况下进行消融。现在统一封装到 frozen
+    dataclass 中，作为 ``CycleStateTrajectoryGenerator.__init__`` 的 ``rollout_queue_coefs``
+    形参传入；调用方也可以传 ``None`` 触发默认值。
+
+    字段命名按"被驱动的量 + 相位 / 速度 / phase_change 方向"组织，例如
+    ``waiting_ratio_red_inc`` 表示"红灯期 waiting_ratio 的每步增量"。
+    单位都是"无量纲的 queue feature 增量 / 步"，因此 0.10 ≈ 10 步后稳定红灯
+    可让 waiting_ratio 增长到 1.0 上限附近。
+
+    暴露这些系数后可以做：
+    1. 消融：把 ``waiting_ratio_red_inc`` 置 0 验证"红灯期等待比例增长"是否真的
+       是 ADE 改进的关键因素。
+    2. Stage 协议对比：warmup 用小系数（如 0.04）抑制 rollout 发散，refine 用
+       默认 0.08/0.10/0.12 恢复相位推进信号。
+    3. Sensitivity grid：在 [0, 0.3] 区间扫描 ``queue_count_stopline_weight``，
+       寻找优于硬编码默认值的配置。
+    """
+
+    # --- waiting_ratio 相位驱动 -------------------------------------------------
+    waiting_ratio_red_inc: float = 0.08
+    waiting_ratio_yellow_inc: float = 0.03
+    waiting_ratio_green_dec: float = 0.12
+
+    # --- release_ratio 相位驱动 -------------------------------------------------
+    release_ratio_green_inc: float = 0.14
+    release_ratio_red_dec: float = 0.08
+    release_ratio_yellow_dec: float = 0.04
+
+    # --- lane_queue_length 相位 / 切换驱动 --------------------------------------
+    lane_queue_length_red_inc: float = 0.10
+    lane_queue_length_yellow_inc: float = 0.03
+    lane_queue_length_green_dec: float = 0.12
+    lane_queue_length_phase_change_inc: float = 0.05
+
+    # --- stopline_occupancy 相位驱动 -------------------------------------------
+    stopline_occupancy_red_inc: float = 0.10
+    stopline_occupancy_green_dec: float = 0.12
+
+    # --- front_of_queue 相位驱动 -----------------------------------------------
+    front_of_queue_red_inc: float = 0.05
+    front_of_queue_green_dec: float = 0.05
+
+    # --- stop_dist 速度 / 切换 / step 驱动 --------------------------------------
+    stop_dist_pred_speed_dec: float = 0.08
+    stop_dist_step_discount_dec: float = 0.03
+    stop_dist_phase_change_inc: float = 0.02
+
+    # --- queue_count 内部加权 (lane_queue_length + w * stopline_occupancy) ------
+    queue_count_stopline_weight: float = 0.5
+
+    # --- lane_density 拼接权重 (w_prev * prev + w_lane * lane_queue_length) -----
+    lane_density_prev_weight: float = 0.6
+    lane_density_lane_queue_weight: float = 0.4
+
+    # --- lane_mean_speed 拼接权重 (w_prev * prev + w_pred * pred_speed) --------
+    lane_mean_speed_prev_weight: float = 0.6
+    lane_mean_speed_pred_weight: float = 0.4
+
+    # --- 物理上界 (clamp max) ---------------------------------------------------
+    # 下界固定为 0.0 (queue feature 不允许为负), 上界与具体物理量挂钩,
+    # 默认值与原硬编码保持一致, 留给数据分布变化时再调整。
+    waiting_ratio_max: float = 1.0
+    release_ratio_max: float = 1.0
+    lane_queue_length_max: float = 1.5
+    stopline_occupancy_max: float = 1.0
+    front_of_queue_max: float = 1.0
+    stop_dist_max: float = 2.0
+    queue_count_max: float = 1.5
+    lane_density_max: float = 1.5
+    lane_mean_speed_max: float = 1.5
+
+
+def apply_rollout_coefs_override(base, override_dict):
+    """Phase 3 #16:从 ``override_dict`` (例如 CLI 解析的 JSON) 中挑选 ``base``
+    ``RolloutQueueCoefs`` 上存在的字段做 ``dataclasses.replace`` 合并。
+
+    任何 ``override_dict`` 中不属于 dataclass 字段的 key 会被静默忽略,
+    避免拼写错误把超参直接丢掉又不报错; 类型不匹配时同样返回 ``base``,
+    避免一个 CLI 错参让整个训练启动失败。
+    """
+    import dataclasses
+
+    if not override_dict:
+        return base, ()
+    valid_fields = {
+        f.name: f.type for f in dataclasses.fields(base)
+    }
+    cleaned = {}
+    invalid_keys = []
+    for key, value in override_dict.items():
+        if key not in valid_fields:
+            continue
+        expected_type = valid_fields[key]
+        try:
+            cleaned[key] = expected_type(value)
+        except (TypeError, ValueError):
+            invalid_keys.append(key)
+    if not cleaned:
+        return base, tuple(invalid_keys)
+    try:
+        return dataclasses.replace(base, **cleaned), tuple(invalid_keys)
+    except (TypeError, ValueError):
+        return base, tuple(invalid_keys or cleaned.keys())
+
 
 def get_noise(shape, noise_type, device):
     """生成噪声，用于提升未来轨迹采样的多样性。
@@ -341,7 +455,7 @@ class GATEncoder(nn.Module):
         return dire
 
     def relation_Matrix(self, curr_dire):
-        """根据距离和方向约束构造关系矩阵。
+        """根据距离和方向约束构造关系矩阵(向量化版本)。
 
         逻辑上等价于：
         1. 先筛掉太远的邻居；
@@ -356,45 +470,47 @@ class GATEncoder(nn.Module):
         Returns:
             关系矩阵 `r`，形状 `(F, N, N)`。若 `r[f, i, j] = 1`，表示在第 `f`
             帧中，agent `j` 会被视为 agent `i` 的有效邻居。
+
+        Phase 5 #9 修复:方向扇区 Bug 在 commit bc47e72 中已修复,但原实现
+        仍为三层 Python 嵌套循环 + numpy ``pdist``,在 batch 较大时瓶颈
+        明显。改为:
+
+        1. 距离门控用 ``(pos.unsqueeze(2) - pos.unsqueeze(1))`` 一次性算出
+        2. 方向角 pairwise 用 ``torch.atan2`` 广播算出
+        3. 扇区判定统一为 ``(delta <= 62) | (delta >= 298)``,
+           其中 ``delta = (dire - a + 360) % 360``,统一处理 wrap-around
+           (原版的 ``up > 360`` / ``62 <= up <= 124`` 分支等价于此)
+
+        结果与原实现逐元素 ``torch.allclose``,但消除了
+        ``F * N * N`` 量级的 Python 循环开销。
         """
-        currdata = curr_dire[:,:,2:4]
-        F, N, D = currdata.size()
-        # d: 距离门控矩阵，先依据欧氏距离筛掉过远车辆。
-        d= np.zeros((F, N, N))
-        # r: 最终关系矩阵，同时满足距离与方向约束的边会被置为 1。
-        r=np.zeros((F, N, N))
+        currdata = curr_dire[:, :, 2:4]  # (F, N, 2)
+        F, N, _ = currdata.shape
         # 156 是论文实现中使用的邻域半径阈值。
         l = 156
 
+        # 1. 距离门控
+        # diff_pos[f, i, j, :] = currdata[f, j] - currdata[f, i],即
+        # 从 agent i 指向邻居 j 的位移(与原 ``neig_direction`` 的
+        # ``currdata[n_neig] - currdata[cur_n]`` 语义一致)
+        diff_pos = currdata.unsqueeze(1) - currdata.unsqueeze(2)  # (F, N, N, 2)
+        d = torch.sqrt((diff_pos ** 2).sum(dim=-1))  # (F, N, N)
+        d_gate = (d <= l).float()
 
-        currdata = currdata.detach().cpu().numpy()
-        for cur_f in range(F):
-            d[cur_f] = squareform(pdist(currdata[cur_f], metric='euclidean'))
-        d = np.where(d<=l,1,0)
+        # 2. pairwise 方向角 (F, N, N)
+        diff_x = diff_pos[..., 0]
+        diff_y = diff_pos[..., 1]
+        # atan2 返回 [-pi, pi]; 转成 [0, 360)
+        dire = torch.atan2(diff_y, diff_x) * (180.0 / math.pi)  # (F, N, N)
+        dire = dire % 360
 
-        for cur_f in range(F):
-            for cur_n in range(N):
-                # 第 5 个通道是方向角。以它为中心构造一个前向扇区，只保留更可能
-                # 影响当前车辆决策的邻居，体现论文的“不连续依赖”思想。
-                a = curr_dire[cur_f, cur_n, 5]
-                up = a + 62  #62
-                down = a - 62
+        # 3. 扇区判定:统一为 ``delta ∈ [0, 62] ∪ [298, 360)``
+        # a = curr_dire[:, :, 5] 是每个 agent 的朝向角, 形状 (F, N)
+        a = curr_dire[:, :, 5]
+        delta = (dire - a.unsqueeze(2) + 360.0) % 360  # (F, N, N)
+        in_sector = ((delta <= 62) | (delta >= 298)).float()
 
-                for n_neig in range(N):
-                    if (d[cur_f, cur_n, n_neig] == 1):
-                        dire_n_neig = self.neig_direction(
-                            currdata[cur_f, n_neig, 0] - currdata[cur_f, cur_n, 0],
-                            currdata[cur_f, n_neig, 1] - currdata[cur_f, cur_n, 1]
-                        )
-                        if up> 360:
-                            if (down <= dire_n_neig <= 360) or (0 <= dire_n_neig <= (up - 360)):
-                                r[cur_f, cur_n, n_neig] = 1
-                        elif 62 <= up <= 124:
-                            if (down + 360 <= dire_n_neig <= 360) or (0 <= dire_n_neig <= up):
-                                r[cur_f, cur_n, n_neig] = 1
-                        elif down <= dire_n_neig <= up:
-                            r[cur_f, cur_n, n_neig] = 1
-        r = torch.tensor(r, dtype=torch.float32, device=curr_dire.device)
+        r = d_gate * in_sector
         return r
 
 
@@ -414,7 +530,7 @@ class GATEncoder(nn.Module):
         """
         graph_embeded_data = []
 
-        for start, end in seq_start_end.data:
+        for start, end in seq_start_end.tolist():
             curr_seq_embedding_traj = obs_traj_embedding[:, start:end, :]
             curr_obs_dire = obs_dire[:, start:end, :]
             Relation = self.relation_Matrix(curr_obs_dire)
@@ -443,7 +559,7 @@ class seqGATEncoder(nn.Module):
             graph_embeded_data: 时序交互增强后的特征。
         """
         graph_embeded_data = []
-        for start, end in seq_start_end.data:
+        for start, end in seq_start_end.tolist():
             curr_seq_embedding_traj = obs_traj_embedding[:, start:end, :]
             curr_seq_graph_embedding = self.seq_gat_net(curr_seq_embedding_traj)
             graph_embeded_data.append(curr_seq_graph_embedding)
@@ -505,11 +621,23 @@ class TrajectoryGenerator(nn.Module):
 
         # 轨迹编码分支：逐帧吃相对位移。
         self.traj_lstm_model = nn.LSTMCell(traj_lstm_input_size, traj_lstm_hidden_size)
-        # 图交互编码分支：历史上这里原本预留了一个 graph LSTM 用于继续处理图特征。
-        # 在当前 forward 主路径中，这个模块没有被实际调用，图时序聚合改由
-        # seqGATEncoder 完成，但保留该成员有助于和原始论文/旧版实现对照。
+        # ⚠️ 保留但未使用(Phase 5 #11):``graph_lstm_model`` 是早期版本
+        # 中用于在 GAT 之上再做时序聚合的 LSTMCell。重构后图时序聚合
+        # 改由 ``seqGATEncoder`` 完成,本模块在 forward 主路径中**没有**
+        # 被调用。出于"旧版实现可对照、checkpoint 兼容旧图"考虑保留
+        # 该成员,但**不要**在 forward 中引入新的调用点;如需
+        # 真正的 graph 时序聚合,请直接扩展 ``seqGATEncoder``。
+        # 测试 ``test_graph_lstm_model_is_intentionally_unused`` 会
+        # 在 forward 前后断言该模块从未被触发,防止意外回归。
         self.graph_lstm_model = nn.LSTMCell(
             graph_network_out_dims, graph_lstm_hidden_size
+        )
+        # 静态计数器,仅用于上面那条"未使用"断言;不是 forward 状态。
+        # 任何对 ``graph_lstm_model`` 的调用都会把 ``_graph_lstm_call_count``
+        # 加 1,从而被单元测试捕获。
+        self._graph_lstm_call_count = 0
+        self.graph_lstm_model.register_forward_hook(
+            self._count_graph_lstm_call
         )
 
         # 交通灯状态嵌入：把距离和灯态映射到更紧凑的语义空间。
@@ -535,6 +663,10 @@ class TrajectoryGenerator(nn.Module):
         # 解码器：每一步输入上一时刻位移，输出新的隐状态。
         self.pred_lstm_model = nn.LSTMCell(traj_lstm_input_size, self.pred_lstm_hidden_size)
 
+    def _count_graph_lstm_call(self, module, inputs, output):
+        """记录 ``graph_lstm_model`` 被调用的次数。"""
+        self._graph_lstm_call_count += 1
+
     def init_hidden_traj_lstm(self, batch):
         """初始化轨迹 LSTM 的隐状态。
 
@@ -546,8 +678,8 @@ class TrajectoryGenerator(nn.Module):
         """
         device = get_module_device(self)
         return (
-            torch.randn(batch, self.traj_lstm_hidden_size, device=device),
-            torch.randn(batch, self.traj_lstm_hidden_size, device=device),
+            torch.zeros(batch, self.traj_lstm_hidden_size, device=device),
+            torch.zeros(batch, self.traj_lstm_hidden_size, device=device),
         )
 
     def init_hidden_graph_lstm(self, batch):
@@ -558,8 +690,8 @@ class TrajectoryGenerator(nn.Module):
         """
         device = get_module_device(self)
         return (
-            torch.randn(batch, self.graph_lstm_hidden_size, device=device),
-            torch.randn(batch, self.graph_lstm_hidden_size, device=device),
+            torch.zeros(batch, self.graph_lstm_hidden_size, device=device),
+            torch.zeros(batch, self.graph_lstm_hidden_size, device=device),
         )
 
     def init_hidden_light_lstm(self, batch):
@@ -570,8 +702,8 @@ class TrajectoryGenerator(nn.Module):
         """
         device = get_module_device(self)
         return (
-            torch.randn(batch, self.traj_lstm_hidden_size, device=device),
-            torch.randn(batch, self.traj_lstm_hidden_size, device=device),
+            torch.zeros(batch, self.traj_lstm_hidden_size, device=device),
+            torch.zeros(batch, self.traj_lstm_hidden_size, device=device),
         )
 
     def add_noise(self, _input, seq_start_end):
@@ -594,17 +726,35 @@ class TrajectoryGenerator(nn.Module):
         noise_shape = (seq_start_end.size(0),) + self.noise_dim
 
         z_decoder = get_noise(noise_shape, self.noise_type, _input.device)
+        expanded_noise = self.expand_scene_noise_to_batch(z_decoder, seq_start_end)
+        return torch.cat([_input, expanded_noise], dim=1)
 
-        _list = []
-        for idx, (start, end) in enumerate(seq_start_end):
-            start = start.item()
-            end = end.item()
-            _vec = z_decoder[idx].view(1, -1)
-            _to_cat = _vec.repeat(end - start, 1)
-            _list.append(torch.cat([_input[start:end], _to_cat], dim=1))
-        decoder_h = torch.cat(_list, dim=0)
+    def expand_scene_noise_to_batch(self, scene_noise, seq_start_end):
+        """把 scene-level 噪声复制到 scene 内每个 agent。
 
-        return decoder_h
+        ``scene_noise`` 的第 0 维对应 ``seq_start_end`` 的 scene 维。输出张量
+        形状为 ``(batch, noise_dim)``，可直接与 agent-level hidden state 对齐。
+        """
+        expanded = []
+        for idx, (start, end) in enumerate(seq_start_end.tolist()):
+            expanded.append(scene_noise[idx].view(1, -1).expand(end - start, -1))
+        return torch.cat(expanded, dim=0)
+
+    def inject_per_step_decoder_noise(
+        self, pred_lstm_hidden, seq_start_end, noise_scale=0.1
+    ):
+        """Phase 1 #18:在每个解码步前向 decoder hidden 注入新噪声。"""
+        if not self.noise_dim or self.noise_dim[0] <= 0:
+            return pred_lstm_hidden
+        step_noise = get_noise(
+            (seq_start_end.size(0),) + self.noise_dim,
+            self.noise_type,
+            pred_lstm_hidden.device,
+        )
+        expanded_noise = self.expand_scene_noise_to_batch(step_noise, seq_start_end)
+        noise_pad = torch.zeros_like(pred_lstm_hidden)
+        noise_pad[:, -self.noise_dim[0] :] = expanded_noise
+        return pred_lstm_hidden + noise_scale * noise_pad
 
     def get_last_state(self,obs_traj_pos,obs_state):
         """从最后一帧观测状态里构造交通灯条件特征。
@@ -765,11 +915,13 @@ class TrajectoryGenerator(nn.Module):
                         obs_traj_rel[-self.pred_len:].size(0), dim=0
                     )  # 12帧
             ):
-                teacher_force = random.random() < teacher_forcing_ratio
+                # Phase 1 #18 fix: per-step noise injection during decoding.
+                pred_lstm_hidden = self.inject_per_step_decoder_noise(
+                    pred_lstm_hidden, seq_start_end
+                )
+
+                teacher_force = torch.rand(1, device=pred_lstm_hidden.device).item() < teacher_forcing_ratio
                 input_t = input_t if teacher_force else output.unsqueeze(0)
-                # 注意：图特征和交通灯特征并不是在每个时间步直接作为 LSTM 输入，
-                # 而是已经注入到了 pred_lstm_hidden 的初始化里。每一步真正送入
-                # pred_lstm_model 的，是上一时刻的位移向量。
                 pred_lstm_hidden, pred_lstm_c_t = self.pred_lstm_model(
                     input_t.squeeze(0), (pred_lstm_hidden, pred_lstm_c_t)  # 136
                 )
@@ -787,6 +939,11 @@ class TrajectoryGenerator(nn.Module):
         else:
             # 推理阶段完全依赖自身预测，自回归滚动未来 12 帧。
             for i in range(self.pred_len):
+                # Phase 1 #18 fix: per-step noise injection during decoding.
+                pred_lstm_hidden = self.inject_per_step_decoder_noise(
+                    pred_lstm_hidden, seq_start_end
+                )
+
                 pred_lstm_hidden, pred_lstm_c_t = self.pred_lstm_model(
                     output, (pred_lstm_hidden, pred_lstm_c_t)
                 )
@@ -846,9 +1003,21 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         disable_queue_rollout=False,
         disable_lane_queue_anchor=False,
         disable_decoder_state_residual=False,
+        disable_aux_losses=False,
         rollout_residual_scale=1.0,
         detach_rollout_state=False,
+        rollout_queue_coefs=None,
     ):
+        # Phase 4 #22: ``disable_aux_losses`` 是消融实验的统一主开关。
+        # 当启用时，所有 CycleState 特有功能（state gating、queue rollout、
+        # lane queue anchor、decoder state residual）一次性关闭，四个独立
+        # disable 标志位被强制置为 True，使模型在行为上与 baseline 对齐。
+        if disable_aux_losses:
+            disable_state_gating = True
+            disable_queue_rollout = True
+            disable_lane_queue_anchor = True
+            disable_decoder_state_residual = True
+        self.disable_aux_losses = disable_aux_losses
         super(CycleStateTrajectoryGenerator, self).__init__(
             obs_len=obs_len,
             pred_len=pred_len,
@@ -894,6 +1063,23 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         self.disable_decoder_state_residual = disable_decoder_state_residual
         self.rollout_residual_scale = rollout_residual_scale
         self.detach_rollout_state = detach_rollout_state
+        # Phase 3 #16: 把 ``rollout_queue_features`` 内的硬编码物理系数集中到
+        # ``RolloutQueueCoefs`` dataclass,默认 ``None`` 触发 dataclass 默认值,
+        # 行为与原裸字面量完全一致 (向后兼容)。
+        self.rollout_queue_coefs = (
+            rollout_queue_coefs if rollout_queue_coefs is not None else RolloutQueueCoefs()
+        )
+
+        # Phase 4 #29: 数据集归一化参数持久化。
+        # 这些参数在 __init__ 中作为普通 float 属性存在，不进入 state_dict，
+        # 因此不会随 checkpoint 保存/恢复。norm_params/load_norm_params 提供
+        # 显式的序列化/反序列化接口，确保断点续训和评估时使用一致的归一化量纲。
+        self._norm_param_keys = (
+            "queue_count_norm",
+            "queue_speed_norm",
+            "queue_distance_norm",
+            "cycle_time_norm",
+        )
 
         self.queue_feature_embedding = nn.Sequential(
             nn.Linear(self.queue_feature_dim, self.queue_lstm_hidden_size),
@@ -956,8 +1142,17 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         # 显式辅助预测头：
         # 让 queue/cycle 分支不仅“存在”，还要对可解释的中观/宏观状态负责，
         # 比直接截取 hidden 向量前几维做监督更稳、更易解释。
-        self.queue_aux_head = nn.Linear(self.queue_lstm_hidden_size, 6)
-        self.cycle_aux_head = nn.Linear(self.cycle_lstm_hidden_size, 6)
+        # Phase 0 #4 修复：拆分为独立子空间，避免回归和分类共享同一组参数。
+        # - queue_aux_reg_head：4 维回归 (count/waiting/release/lane)
+        # - queue_aux_cls_head：2 维二分类 (stop-line/front-of-queue)
+        # - cycle_aux_phase_head：3 维相位分类
+        # - cycle_aux_time_head：2 维 elapsed/remaining 回归
+        # - cycle_aux_change_head：1 维相位切换二分类
+        self.queue_aux_reg_head = nn.Linear(self.queue_lstm_hidden_size, 4)
+        self.queue_aux_cls_head = nn.Linear(self.queue_lstm_hidden_size, 2)
+        self.cycle_aux_phase_head = nn.Linear(self.cycle_lstm_hidden_size, 3)
+        self.cycle_aux_time_head = nn.Linear(self.cycle_lstm_hidden_size, 2)
+        self.cycle_aux_change_head = nn.Linear(self.cycle_lstm_hidden_size, 1)
         # 相位条件门控：
         # 同样的 queue/cycle 记忆，在红灯、绿灯、黄灯下的作用并不一致。
         # 这里用显式门控让状态记忆受当前灯态条件调制，而不是简单拼接。
@@ -1030,20 +1225,47 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         nn.init.constant_(self.rollout_decode_context_gate[2].bias, -2.0)
         self.debug_last_aux = None
 
+    def norm_params(self):
+        """导出数据集归一化参数，用于写入 checkpoint。
+
+        Returns:
+            dict[str, float]: 四个归一化参数。
+        """
+        return {key: getattr(self, key) for key in self._norm_param_keys}
+
+    def load_norm_params(self, norm_dict):
+        """从 checkpoint 恢复归一化参数。
+
+        若 ``norm_dict`` 为 None 或缺少某个 key，该参数保持当前值不变，
+        保证向后兼容旧版 checkpoint（旧 checkpoint 不包含此字段时不会出错）。
+
+        Args:
+            norm_dict: ``norm_params()`` 产出的 dict，或 ``None``。
+        """
+        if norm_dict is None:
+            return
+        for key in self._norm_param_keys:
+            if key in norm_dict:
+                setattr(self, key, float(norm_dict[key]))
+        logging.info(
+            "CycleState norm params restored from checkpoint: %s",
+            ", ".join(f"{k}={getattr(self, k):.2f}" for k in self._norm_param_keys),
+        )
+
     def init_hidden_queue_lstm(self, batch):
         """初始化 queue memory 的隐状态。"""
         device = get_module_device(self)
         return (
-            torch.randn(batch, self.queue_lstm_hidden_size, device=device),
-            torch.randn(batch, self.queue_lstm_hidden_size, device=device),
+            torch.zeros(batch, self.queue_lstm_hidden_size, device=device),
+            torch.zeros(batch, self.queue_lstm_hidden_size, device=device),
         )
 
     def init_hidden_cycle_lstm(self, batch):
         """初始化 cycle memory 的隐状态。"""
         device = get_module_device(self)
         return (
-            torch.randn(batch, self.cycle_lstm_hidden_size, device=device),
-            torch.randn(batch, self.cycle_lstm_hidden_size, device=device),
+            torch.zeros(batch, self.cycle_lstm_hidden_size, device=device),
+            torch.zeros(batch, self.cycle_lstm_hidden_size, device=device),
         )
 
     def build_cycle_features(self, state_seq):
@@ -1070,8 +1292,16 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         phase_change[1:] = (phase[1:] != phase[:-1]).float().unsqueeze(2)
         return torch.cat((phase_one_hot, elapsed, remaining, phase_change), dim=2)
 
-    def get_step_cycle_feature(self, state_frame):
-        """构造单步解码阶段使用的周期状态特征。"""
+    def get_step_cycle_feature(self, state_frame, prev_phase=None):
+        """构造单步解码阶段使用的周期状态特征。
+
+        Args:
+            state_frame: `(batch, 4)` 单帧信号状态。
+            prev_phase: `(batch,)` 上一帧的 phase 索引；如果为 ``None`` 或未
+                提供，则 ``phase_change`` 退化为全 0（保持向后兼容，调用方
+                无 prev 信息时使用）。Phase 2 #6 修复：补齐预测期
+                ``phase_change`` 跨帧比较，避免 cycle LSTM 输入丢失相位
+                切换信号。"""
         phase = state_frame[:, 2].long().clamp(min=0, max=2)
         phase_one_hot = F.one_hot(phase, num_classes=3).float()
         elapsed_raw = state_frame[:, 3:4]
@@ -1080,7 +1310,11 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         remaining = ((phase_limits - elapsed_raw) / self.cycle_time_norm).clamp(
             min=0.0, max=2.0
         )
-        phase_change = torch.zeros(state_frame.size(0), 1, device=state_frame.device)
+        if prev_phase is None:
+            phase_change = torch.zeros(state_frame.size(0), 1, device=state_frame.device)
+        else:
+            prev_clamped = prev_phase.long().clamp(min=0, max=2)
+            phase_change = (phase != prev_clamped).float().unsqueeze(1)
         return torch.cat((phase_one_hot, elapsed, remaining, phase_change), dim=1)
 
     def build_queue_features(self, obs_traj_pos, obs_traj_rel, obs_state, seq_start_end):
@@ -1141,7 +1375,10 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
 
                 queue_count = ahead_mask.float().sum(dim=1) / self.queue_count_norm
                 lane_density = (lane_count - 1.0) / self.queue_count_norm
-                lane_wait_count = (
+                # 观测期无法直接量测连续物理"长度"，这里用同车道等待车辆数
+                # (归一化) 作为 lane_queue_length proxy，与 rollout 期第 8 维
+                # 的语义槽位保持一致。
+                lane_queue_length = (
                     torch.matmul(same_lane.float(), waiting.unsqueeze(1)).squeeze(1)
                     / self.queue_count_norm
                 )
@@ -1183,7 +1420,7 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                         phase_value[t, start:end],
                         elapsed_value[t, start:end],
                         own_stop_dist,
-                        lane_wait_count,
+                        lane_queue_length,
                         lane_stopline_occupancy,
                         front_of_queue,
                     ],
@@ -1193,7 +1430,24 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         return queue_features
 
     def compute_queue_targets(self, queue_feature_seq):
-        """把中观 queue-wave 统计量转成更强的辅助监督目标。"""
+        """把中观 queue-wave 统计量转成更强的辅助监督目标。
+
+        返回 ``(T, batch, 6)`` 维度严格按以下顺序拼接(Phase 2 #20
+        契约,与 ``train.compute_structured_aux_losses`` 的
+        ``queue_reg_idx=[0,1,2,3]`` / ``queue_cls_idx=[4,5]`` 切分对齐):
+
+            [0] queue_count             (regression, MSE)
+            [1] lane_wait_ratio         (regression, MSE)
+            [2] lane_release_ratio      (regression, MSE)
+            [3] lane_queue_length       (regression, MSE)
+            [4] lane_stopline_occupancy (binary, BCE)
+            [5] front_of_queue          (binary, BCE)
+
+        任何重新排序必须同步修改
+        :func:`build_queue_targets_signature` 与
+        :func:`train.compute_structured_aux_losses` 的 idx 切分,
+        否则 MSE/BCE 会被错误地分配到回归/分类子空间。
+        """
         return torch.stack(
             (
                 queue_feature_seq[:, :, 0],
@@ -1207,24 +1461,75 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         )
 
     def build_lane_queue_anchor_seq(self, queue_feature_seq, lane_ids, seq_start_end):
-        """构造同车道一致性中观锚点。
+        """构造同车道一致性中观锚点(向量化版本)。
 
         直觉上，中观 queue-wave 状态不应完全由单个 agent 的局部特征决定；
-        同一条 lane 上的车辆应共享一个更平滑的“车道级状态共识”。
+        同一条 lane 上的车辆应共享一个更平滑的"车道级状态共识"。
+
+        Phase 5 #8 修复:原实现是 ``scene × time × unique_lane_id`` 三层
+        Python 嵌套循环,在 batch 较大且每场景 unique lane 数多时瓶颈明显。
+        改为:
+
+        1. 一次性 ``repeat_interleave`` 算出 ``agent_scene_idx`` (batch,)
+        2. 联合编码 ``(scene, lane) -> group_key`` 跨场景唯一
+        3. ``index_add_`` 在 ``(T*batch)`` 维度同时累计 sum/count
+        4. 求均值后用 ``mean_features[group_key]`` 广播回原 shape
+
+        结果与原实现逐元素 ``torch.allclose``,但
+        ``T * N * #unique_lane`` 时间复杂度降到 ``T * batch + num_groups`` 量级。
         """
-        anchor_seq = queue_feature_seq.clone()
-        for start, end in seq_start_end.tolist():
-            for t in range(queue_feature_seq.size(0)):
-                scene_lane_ids = lane_ids[t, start:end]
-                scene_queue = queue_feature_seq[t, start:end]
-                unique_lane_ids = torch.unique(scene_lane_ids)
-                for lane_id in unique_lane_ids:
-                    lane_mask = scene_lane_ids == lane_id
-                    lane_mean = scene_queue[lane_mask].mean(dim=0, keepdim=True)
-                    anchor_seq[t, start:end][lane_mask] = lane_mean.expand(
-                        lane_mask.sum(), -1
-                    )
-        return anchor_seq
+        T, batch, dim = queue_feature_seq.shape
+        device = queue_feature_seq.device
+        dtype = queue_feature_seq.dtype
+
+        # 1. agent -> scene 映射(无 Python 循环)
+        num_scene = seq_start_end.size(0)
+        scene_sizes = (seq_start_end[:, 1] - seq_start_end[:, 0]).to(device)
+        agent_scene_idx = torch.repeat_interleave(
+            torch.arange(num_scene, device=device, dtype=torch.long),
+            scene_sizes,
+        )
+
+        # 2. (t, scene, lane) 联合编码,确保跨 t/跨 scene 的 lane id 不会撞 key
+        # 注意:必须把 t 维度也编码进去,否则同 (scene, lane) 在不同时刻的
+        # 特征会被错误平均,违反原 loop 的 ``for t in range(T)`` 语义
+        # (原版每帧独立计算 lane 均值)。
+        max_lane_id = (
+            int(lane_ids.max().item()) + 1 if lane_ids.numel() > 0 else 1
+        )
+        # 防御 max_lane_id==0 (空 batch):保证 group_key 不退化
+        max_lane_id = max(max_lane_id, 1)
+        per_t_lane_offset = num_scene * max_lane_id
+        t_offsets = (
+            torch.arange(T, device=device, dtype=torch.long).unsqueeze(1)
+            * per_t_lane_offset
+        )
+        group_key = (
+            t_offsets
+            + agent_scene_idx.unsqueeze(0) * max_lane_id
+            + lane_ids.long()
+        )  # (T, batch)
+        num_groups = T * num_scene * max_lane_id
+
+        # 3. 一次性 index_add_ 求和/计数
+        flat_group_key = group_key.reshape(-1)  # (T*batch,)
+        flat_features = queue_feature_seq.reshape(-1, dim)  # (T*batch, dim)
+
+        sum_features = torch.zeros(num_groups, dim, device=device, dtype=dtype)
+        sum_features.index_add_(0, flat_group_key, flat_features)
+
+        count = torch.zeros(num_groups, device=device, dtype=dtype)
+        count.index_add_(
+            0,
+            flat_group_key,
+            torch.ones(T * batch, device=device, dtype=dtype),
+        )
+
+        # 4. 均值(空 group 不会进入广播路径,clamp 仅防御除零)
+        mean_features = sum_features / count.clamp(min=1).unsqueeze(1)
+
+        # 5. 广播回 (T, batch, dim)
+        return mean_features[flat_group_key].reshape(T, batch, dim)
 
     def build_lane_queue_anchor(self, queue_feature, lane_ids, seq_start_end):
         """构造单步 lane-level meso anchor。"""
@@ -1254,6 +1559,11 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         phase_change = current_cycle_feature[:, 5:6]
         phase_id = phase_one_hot.argmax(dim=1)
 
+        # Phase 3 #16: 把方法体内硬编码的物理系数集中到 ``self.rollout_queue_coefs``。
+        # 默认值与原裸字面量完全一致, 行为不变; 但允许通过 ``__init__`` / CLI
+        # 覆盖, 进而支持消融 / sensitivity grid / 阶段协议切换。
+        coefs = self.rollout_queue_coefs
+
         rolled = prev_queue_feature.clone()
         waiting_ratio = rolled[:, 3]
         release_ratio = rolled[:, 4]
@@ -1274,67 +1584,75 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
 
         waiting_ratio = torch.clamp(
             waiting_ratio
-            + 0.08 * is_red_like * (1.0 - progress)
-            + 0.03 * is_yellow_like
-            - 0.12 * is_green_like * pred_speed_norm,
+            + coefs.waiting_ratio_red_inc * is_red_like * (1.0 - progress)
+            + coefs.waiting_ratio_yellow_inc * is_yellow_like
+            - coefs.waiting_ratio_green_dec * is_green_like * pred_speed_norm,
             min=0.0,
-            max=1.0,
+            max=coefs.waiting_ratio_max,
         )
         release_ratio = torch.clamp(
             release_ratio
-            + 0.14 * is_green_like * (1.0 - remaining_progress + pred_speed_norm)
-            - 0.08 * is_red_like
-            - 0.04 * is_yellow_like,
+            + coefs.release_ratio_green_inc * is_green_like * (1.0 - remaining_progress + pred_speed_norm)
+            - coefs.release_ratio_red_dec * is_red_like
+            - coefs.release_ratio_yellow_dec * is_yellow_like,
             min=0.0,
-            max=1.0,
+            max=coefs.release_ratio_max,
         )
         lane_queue_length = torch.clamp(
             lane_queue_length
-            + 0.10 * is_red_like
-            + 0.03 * is_yellow_like
-            - 0.12 * is_green_like * pred_speed_norm
-            + 0.05 * phase_change.squeeze(1),
+            + coefs.lane_queue_length_red_inc * is_red_like
+            + coefs.lane_queue_length_yellow_inc * is_yellow_like
+            - coefs.lane_queue_length_green_dec * is_green_like * pred_speed_norm
+            + coefs.lane_queue_length_phase_change_inc * phase_change.squeeze(1),
             min=0.0,
-            max=1.5,
+            max=coefs.lane_queue_length_max,
         )
         stopline_occupancy = torch.clamp(
             stopline_occupancy
-            + 0.10 * is_red_like
-            - 0.12 * is_green_like * pred_speed_norm,
+            + coefs.stopline_occupancy_red_inc * is_red_like
+            - coefs.stopline_occupancy_green_dec * is_green_like * pred_speed_norm,
             min=0.0,
-            max=1.0,
+            max=coefs.stopline_occupancy_max,
         )
         front_of_queue = torch.clamp(
             front_of_queue
-            + 0.05 * is_red_like
-            - 0.05 * is_green_like * pred_speed_norm,
+            + coefs.front_of_queue_red_inc * is_red_like
+            - coefs.front_of_queue_green_dec * is_green_like * pred_speed_norm,
             min=0.0,
-            max=1.0,
+            max=coefs.front_of_queue_max,
         )
         # 随着车辆预测位置向前推进，距离停止线逐步减小；相位切换会带来轻微不连续调整。
         step_discount = float(step_index + 1) / float(max(self.pred_len, 1))
         stop_dist = torch.clamp(
-            stop_dist - 0.08 * pred_speed_norm - 0.03 * step_discount + 0.02 * phase_change.squeeze(1),
+            stop_dist
+            - coefs.stop_dist_pred_speed_dec * pred_speed_norm
+            - coefs.stop_dist_step_discount_dec * step_discount
+            + coefs.stop_dist_phase_change_inc * phase_change.squeeze(1),
             min=0.0,
-            max=2.0,
+            max=coefs.stop_dist_max,
         )
         queue_count = torch.clamp(
-            waiting_ratio * (lane_queue_length + 0.5 * stopline_occupancy),
+            waiting_ratio
+            * (
+                lane_queue_length
+                + coefs.queue_count_stopline_weight * stopline_occupancy
+            ),
             min=0.0,
-            max=1.5,
+            max=coefs.queue_count_max,
         )
         lane_density = torch.clamp(
-            0.6 * rolled[:, 1] + 0.4 * lane_queue_length,
+            coefs.lane_density_prev_weight * rolled[:, 1]
+            + coefs.lane_density_lane_queue_weight * lane_queue_length,
             min=0.0,
-            max=1.5,
+            max=coefs.lane_density_max,
         )
         lane_mean_speed = torch.clamp(
-            0.6 * rolled[:, 2]
-            + 0.4 * (
+            coefs.lane_mean_speed_prev_weight * rolled[:, 2]
+            + coefs.lane_mean_speed_pred_weight * (
                 pred_speed / max(self.queue_speed_norm, 1e-6)
             ),
             min=0.0,
-            max=1.5,
+            max=coefs.lane_mean_speed_max,
         )
         phase_value = phase_id.float() / 2.0
         elapsed_value = elapsed.squeeze(1).clamp(min=0.0, max=2.0)
@@ -1360,16 +1678,30 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         obs_state,
         pred_state,
     ):
-        """统一训练态/推理态的单步灯态与周期上下文构造。"""
+        """统一训练态/推理态的单步灯态与周期上下文构造。
+
+        Phase 2 #6 修复：``prev_phase`` 显式从上一帧传入，
+        让 ``phase_change`` 在预测期能反映真实的相位切换。
+        对于 step 0，使用 obs_state 最后一帧作为 prev；对于 step > 0，
+        使用 pred_state 上一步作为 prev。"""
         if step_index == 0:
             light_state = self.get_last_state(obs_traj_pos, obs_state)
-            current_cycle_feature = self.get_step_cycle_feature(obs_state[-1])
+            # 观测期最后一帧的相位作为 step 0 的 prev_phase。
+            # obs_state 至少应有 1 帧；用最后一帧自身作 prev 时
+            # phase_change 退化为 0，与 build_cycle_features 行为一致。
+            prev_phase = obs_state[-1, :, 2]
+            current_cycle_feature = self.get_step_cycle_feature(
+                obs_state[-1], prev_phase=prev_phase
+            )
         else:
             light_state = self.get_next_state(
                 pred_traj_rel, obs_traj_pos, pred_state
             )
+            # 预测期上一步的相位作为 prev_phase；
+            # 跨帧 phase_change 由 get_step_cycle_feature 内部计算。
+            prev_phase = pred_state[step_index - 2, :, 2]
             current_cycle_feature = self.get_step_cycle_feature(
-                pred_state[step_index - 1]
+                pred_state[step_index - 1], prev_phase=prev_phase
             )
         light_state_embedding = self.light_embedding(light_state)
         cycle_step_embedding = self.cycle_step_embedding(current_cycle_feature)
@@ -1442,7 +1774,13 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
             "next_lane_queue_anchor": next_lane_queue_anchor,
             "queue_hidden": rollout_queue_h_t,
             "queue_cell": rollout_queue_c_t,
-            "queue_pred": self.queue_aux_head(rollout_queue_h_t),
+            "queue_pred": torch.cat(
+                (
+                    self.queue_aux_reg_head(rollout_queue_h_t),
+                    self.queue_aux_cls_head(rollout_queue_h_t),
+                ),
+                dim=-1,
+            ),
             "queue_target": self.compute_queue_targets(
                 current_queue_feature.unsqueeze(0)
             ).squeeze(0),
@@ -1615,7 +1953,7 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
             "decoder_state_init_residual": None,
             "decoder_state_init_residual_norm": None,
             "decoder_state_step_residual_seq": None,
-            "decoder_state_step_residual_norm_seq": None,
+            "decoder_state_step_residual_norm": None,
             "traffic_context": traffic_context,
         }
 
@@ -1682,11 +2020,23 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         )
         self.debug_last_aux["queue_hidden_last"] = gated_queue_last
         self.debug_last_aux["cycle_hidden_last"] = gated_cycle_last
-        self.debug_last_aux["queue_pred_last"] = self.queue_aux_head(
-            gated_queue_last
+        # Phase 0 #4 修复：queue/cycle aux 头拆分为 reg/cls 子头，
+        # 此处拼接为 [reg_part, cls_part] / [phase_part, time_part, change_part]
+        # 与 train.py compute_structured_aux_losses 的维度切片顺序一致。
+        self.debug_last_aux["queue_pred_last"] = torch.cat(
+            (
+                self.queue_aux_reg_head(gated_queue_last),
+                self.queue_aux_cls_head(gated_queue_last),
+            ),
+            dim=-1,
         )
-        self.debug_last_aux["cycle_pred_last"] = self.cycle_aux_head(
-            gated_cycle_last
+        self.debug_last_aux["cycle_pred_last"] = torch.cat(
+            (
+                self.cycle_aux_phase_head(gated_cycle_last),
+                self.cycle_aux_time_head(gated_cycle_last),
+                self.cycle_aux_change_head(gated_cycle_last),
+            ),
+            dim=-1,
         )
         pred_lstm_hidden = self.add_noise(encoded_before_noise_hidden, seq_start_end)
         init_state_residual = self.build_decoder_state_residual(
@@ -1721,7 +2071,12 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
             for i, input_t in enumerate(
                 obs_traj_rel[-self.pred_len :].chunk(self.pred_len, dim=0)
             ):
-                teacher_force = random.random() < teacher_forcing_ratio
+                # Phase 1 #18 fix: per-step noise injection during decoding.
+                pred_lstm_hidden = self.inject_per_step_decoder_noise(
+                    pred_lstm_hidden, seq_start_end
+                )
+
+                teacher_force = torch.rand(1, device=pred_lstm_hidden.device).item() < teacher_forcing_ratio
                 input_t = input_t if teacher_force else output.unsqueeze(0)
                 pred_lstm_hidden, pred_lstm_c_t = self.pred_lstm_model(
                     input_t.squeeze(0), (pred_lstm_hidden, pred_lstm_c_t)
@@ -1796,10 +2151,23 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                     decoder_state_residual_seq.append(step_state_residual)
                 pred_input = torch.cat((light_state_embedding, pred_lstm_hidden), dim=1)
                 output = self.pred_hidden2pos(pred_input)
-                last_rollout_offset = input_t.squeeze(0) if teacher_force else output
+                # #3 P0 fix: train/eval rollout offset consistency.
+                # The eval branch (below) always seeds ``last_rollout_offset``
+                # from the model's own ``output``. The training branch must
+                # follow the same contract, otherwise the queue rollout
+                # branch (rollout_queue_features) is fed ground-truth future
+                # displacement 80% of the time during training and the
+                # model's own (errored) prediction 100% of the time during
+                # inference — a classic exposure-bias / train-eval shift.
+                last_rollout_offset = output
                 pred_traj_rel += [output]
         else:
             for i in range(self.pred_len):
+                # Phase 1 #18 fix: per-step noise injection during decoding.
+                pred_lstm_hidden = self.inject_per_step_decoder_noise(
+                    pred_lstm_hidden, seq_start_end
+                )
+
                 pred_lstm_hidden, pred_lstm_c_t = self.pred_lstm_model(
                     output, (pred_lstm_hidden, pred_lstm_c_t)
                 )
@@ -1890,10 +2258,89 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
             self.debug_last_aux["decoder_state_step_residual_seq"] = torch.stack(
                 decoder_state_residual_seq
             )
-            self.debug_last_aux["decoder_state_step_residual_norm_seq"] = torch.stack(
+            self.debug_last_aux["decoder_state_step_residual_norm"] = torch.stack(
                 [step_residual.detach().norm(dim=1) for step_residual in decoder_state_residual_seq]
             )
         return torch.stack(pred_traj_rel)
+
+
+# ----------------------------------------------------------------
+# Phase 2 #20 契约: target 语义签名
+# ----------------------------------------------------------------
+#
+# ``compute_queue_targets`` / ``build_cycle_features`` 的输出维度顺序
+# 是与 ``train.compute_structured_aux_losses`` 强耦合的"接口契约"。
+# 任何 reorder 必须同步修改这里的 helper docstring,以及
+# ``train.py`` 中 ``queue_reg_idx`` / ``queue_cls_idx`` / cycle slice
+# 的切分。这两个 helper 本身不参与计算,仅作为源码级"签名文档",
+# 被 :mod:`tests.test_cyclestate_protocol` 引用以守卫契约不被破坏。
+# ----------------------------------------------------------------
+
+
+def build_queue_targets_signature():
+    """Phase 2 #20 契约: 声明 ``compute_queue_targets`` 返回的 6 维顺序。
+
+    返回值是一个可断言的结构化签名，而不是布尔占位符。
+    这样测试既能守卫 target dim 顺序，也能守卫 source dim 到
+    aux loss 子空间的映射不会静默漂移。
+
+    Returns:
+        tuple[dict[str, object], ...]: 6 个 target 维度的结构化签名。
+    """
+    return (
+        {
+            "target_index": 0,
+            "name": "queue_count",
+            "loss": "regression",
+            "source_index": 0,
+        },
+        {
+            "target_index": 1,
+            "name": "lane_wait_ratio",
+            "loss": "regression",
+            "source_index": 3,
+        },
+        {
+            "target_index": 2,
+            "name": "lane_release_ratio",
+            "loss": "regression",
+            "source_index": 4,
+        },
+        {
+            "target_index": 3,
+            "name": "lane_queue_length",
+            "loss": "regression",
+            "source_index": 8,
+        },
+        {
+            "target_index": 4,
+            "name": "lane_stopline_occupancy",
+            "loss": "binary",
+            "source_index": 9,
+        },
+        {
+            "target_index": 5,
+            "name": "front_of_queue",
+            "loss": "binary",
+            "source_index": 10,
+        },
+    )
+
+
+def build_cycle_features_signature():
+    """Phase 2 #20 契约: 声明 ``build_cycle_features`` / ``get_step_cycle_feature`` 的 6 维顺序。
+
+    Returns:
+        tuple[dict[str, str | int], ...]: 6 个 cycle 维度的结构化签名。
+    """
+    return (
+        {"target_index": 0, "name": "phase_red", "loss": "classification"},
+        {"target_index": 1, "name": "phase_green", "loss": "classification"},
+        {"target_index": 2, "name": "phase_yellow", "loss": "classification"},
+        {"target_index": 3, "name": "elapsed", "loss": "regression"},
+        {"target_index": 4, "name": "remaining", "loss": "regression"},
+        {"target_index": 5, "name": "phase_change", "loss": "binary"},
+    )
 
 
 class TrajectoryDiscriminator(nn.Module):
@@ -1972,16 +2419,16 @@ class TrajectoryDiscriminator(nn.Module):
         """
         device = get_module_device(self)
         return (
-            torch.randn(batch, self.part_lstm_hidden_size, device=device),
-            torch.randn(batch, self.part_lstm_hidden_size, device=device),
+            torch.zeros(batch, self.part_lstm_hidden_size, device=device),
+            torch.zeros(batch, self.part_lstm_hidden_size, device=device),
         )
 
     def init_hidden_merge_lstm(self, batch):
         """初始化融合 LSTM 隐状态。"""
         device = get_module_device(self)
         return (
-            torch.randn(batch, self.merge_lstm_hidden_size, device=device),
-            torch.randn(batch, self.merge_lstm_hidden_size, device=device),
+            torch.zeros(batch, self.merge_lstm_hidden_size, device=device),
+            torch.zeros(batch, self.merge_lstm_hidden_size, device=device),
         )
 
     def forward(self, traj, state, seq_start_end):
