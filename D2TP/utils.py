@@ -49,11 +49,28 @@ class ProgressMeter(object):
 
 
 def set_logger(log_path):
-    """同时把日志写到终端和文件。"""
+    """同时把日志写到终端和文件。
+
+    Phase 5 #15:重复 handler 防御由 ``if not logger.handlers`` 改为
+    ``if not logger.hasHandlers()``。两者在 ``logging.getLogger()``
+    返回根 logger 时行为相近,但 ``hasHandlers()`` **会沿着 logger
+    层级向上递归检查父 logger**,避免出现以下场景:
+
+    1. 任何上游代码(如 ``logging.basicConfig``、单元测试 fixture、
+       pytest 自带的 caplog)先在 root logger 上挂了 handler;
+    2. 接着 ``set_logger`` 拿到的是**子 logger**(``logging.getLogger("d2tp")``
+       之类),``logger.handlers`` 为空,但 ``hasHandlers()`` 返回 True;
+    3. 原写法会重复 ``addHandler`` 一次,导致日志**重复**输出;
+    4. 新写法会跳过,避免日志重复。
+
+    这里 ``logging.getLogger()`` 默认返回根 logger,行为上两者
+    接近,但 ``hasHandlers()`` 是 Python 文档推荐的"是否已有任何
+    handler 可见"判定方法,长期更稳。
+    """
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
 
-    if not logger.handlers:
+    if not logger.hasHandlers():
         # Logging to a file
         file_handler = logging.FileHandler(log_path)
         file_handler.setFormatter(
@@ -136,16 +153,27 @@ def final_displacement_error(pred_pos, pred_pos_gt, consider_ped=None, mode="sum
         return loss
     else:
         return torch.sum(loss)
-def state_loss(pred_traj_fake,pred_traj_gt,mode='sum'):
-    """轨迹状态辅助损失。"""
+def state_loss(pred_traj_fake, pred_traj_gt, loss_mask=None, mode='sum'):
+    """轨迹状态辅助损失（死代码占位：active 训练走 compute_structured_aux_losses）。
+
+    历史：该函数过去在 ``mode='average'`` 分支引用了未定义的 ``loss_mask``，
+    任何调用都会触发 ``NameError``。修复后 ``loss_mask`` 已被显式声明为形参，
+    并提供 ``None`` 默认值 —— 调用方在 ``mode='sum'/'raw'`` 时无需关心。
+
+    注意：``active training path`` 不调用本函数；``train.py`` 使用
+    ``compute_structured_aux_losses``，本函数保留以兼容早期脚本与历史
+    checkpoint 复现。
+    """
     seq_len, batch, _ = pred_traj_gt.size()
     # equation below , the first part do noing, can be delete
-    pred_gt=pred_traj_gt[:,:,2:4]   # T V C
+    pred_gt = pred_traj_gt[:, :, 2:4]   # T V C
     loss = (pred_gt.permute(1, 0, 2) - pred_traj_fake.permute(1, 0, 2)) ** 2    # V T C
-    x_= (pred_gt.permute(1, 0, 2)[:,-1,0] - pred_traj_fake.permute(1, 0, 2)[:,-1,0])
     if mode == "sum":
         return torch.sum(loss)
     elif mode == "average":
+        if loss_mask is None:
+            # 默认按 (T, V) 全掩膜归一化，与 l2_loss 在 mask=ones 时的行为一致。
+            loss_mask = torch.ones(seq_len, batch, device=loss.device)
         return torch.sum(loss) / torch.numel(loss_mask.data)
     elif mode == "raw":
         return loss.sum(dim=2).sum(dim=1)

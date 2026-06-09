@@ -14,6 +14,18 @@
 
 ---
 
+## ⚠️ Oracle 假设声明（Phase 0 #17）
+
+本研究在训练和推理期间将未来真实交通灯信号状态（`pred_state`）作为输入。`pred_state` 来自数据集中记录的预测期实际信号灯相位与已运行时间（`pred_phase_ids`, `pred_phase_elapsed`）。
+
+**这构成一个 oracle 假设**：模型可以访问推理时不可用的真实未来信号信息。在真实部署场景中，未来的交通灯状态需要由外部信号控制器提前给出或通过预测模块生成，而非从数据集中读取。
+
+**与 baseline 的对齐性**：原始 `D2-TPred` baseline 同样接收 `pred_state` 作为输入。因此，CycleState 与 D2-TPred 在此 oracle 假设上是对齐的——两者都假设未来信号状态已知。本研究的所有 comparable 实验结果都在相同的 oracle 条件下产生。
+
+**后续工作（Phase 0.5）**：计划通过信号退化实验（oracle→predicted 信号替换、敏感度曲线）量化此假设对预测性能（ADE/FDE）的实际贡献。
+
+---
+
 ## 1. 这个研究领域的特点是什么
 
 ### 1.1 轨迹预测本身就是一个强交互、强不确定、多模态的问题
@@ -285,8 +297,8 @@
 
 为了让 `meso/macro` 分支不是“存在但不可解释”的黑箱，我加入了：
 
-- `queue_aux_head`
-- `cycle_aux_head`
+- `queue_aux_reg_head` + `queue_aux_cls_head`
+- `cycle_aux_phase_head` + `cycle_aux_time_head` + `cycle_aux_change_head`
 - structured auxiliary losses
 - warmup / refine / adversarial 分阶段训练协议
 
@@ -462,4 +474,3 @@
    - D2-TPred 强在 `discontinuous dependency`；  
    - CycleState 进一步强调 `full-cycle traffic-state memory`；  
    - 前者更像在 traffic-light scene 下强化微观行为依赖建模，后者更像在 traffic-light scene 下显式加入中观/宏观交通状态记忆。  
-
