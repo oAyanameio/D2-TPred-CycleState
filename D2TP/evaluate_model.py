@@ -17,6 +17,7 @@ from train import (
     build_traffic_context_from_batch,
     compute_best_of_k_metric_sums,
     compute_raw_displacement_metrics,
+    maybe_load_compatible_weights,
     parse_rollout_queue_coefs,
     NumValSamplesTracker,
     reapply_phase_duration_limits_if_overridden,
@@ -251,7 +252,10 @@ def get_generator(checkpoint):
             getattr(args, "rollout_queue_coefs_json", "")
         )
     model = model_cls(**model_kwargs)
-    model.load_state_dict(checkpoint["state_dict"])
+    if args.model_type == "cyclestate":
+        maybe_load_compatible_weights(model, checkpoint["state_dict"])
+    else:
+        model.load_state_dict(checkpoint["state_dict"])
     reapply_phase_duration_limits_if_overridden(
         model,
         getattr(args, "phase_duration_limits", None),

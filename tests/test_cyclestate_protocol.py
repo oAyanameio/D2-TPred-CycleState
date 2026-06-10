@@ -140,9 +140,14 @@ class CycleStateProtocolTest(unittest.TestCase):
         self.assertIn("queue_rollout_hidden_seq", self.model.debug_last_aux)
         self.assertIn("queue_rollout_pred_seq", self.model.debug_last_aux)
         self.assertIn("lane_queue_rollout_anchor_seq", self.model.debug_last_aux)
+        self.assertIn("cycle_rollout_hidden_seq", self.model.debug_last_aux)
         self.assertEqual(
             (12, 3, self.model.queue_lstm_hidden_size),
             tuple(self.model.debug_last_aux["queue_rollout_hidden_seq"].shape),
+        )
+        self.assertEqual(
+            (12, 3, self.model.cycle_lstm_hidden_size),
+            tuple(self.model.debug_last_aux["cycle_rollout_hidden_seq"].shape),
         )
         self.assertEqual(
             (12, 3, 6),
@@ -171,6 +176,8 @@ class CycleStateProtocolTest(unittest.TestCase):
         )
         queue_rollout = self.model.debug_last_aux["queue_rollout_hidden_seq"]
         self.assertFalse(torch.allclose(queue_rollout[0], queue_rollout[-1]))
+        cycle_rollout = self.model.debug_last_aux["cycle_rollout_hidden_seq"]
+        self.assertFalse(torch.allclose(cycle_rollout[0], cycle_rollout[-1]))
         lane_anchor_rollout = self.model.debug_last_aux["lane_queue_rollout_anchor_seq"]
         self.assertTrue(torch.allclose(lane_anchor_rollout[0, 0], lane_anchor_rollout[0, 1]))
         self.assertFalse(torch.allclose(lane_anchor_rollout[0, 0], lane_anchor_rollout[0, 2]))
@@ -297,6 +304,45 @@ class CycleStateProtocolTest(unittest.TestCase):
         self.assertFalse(torch.allclose(recorded_inputs[1], base_queue_feature))
         self.assertFalse(torch.allclose(recorded_inputs[1], recorded_inputs[0]))
 
+    def test_cycle_rollout_uses_previous_step_state(self):
+        traffic_context = self.model.build_traffic_context(
+            self.obs_traj_rel,
+            self.obs_traj,
+            self.obs_state,
+            self.pred_state,
+            self.seq_start_end,
+        )
+        recorded_hidden = []
+        original_rollout = self.model.rollout_cycle_step
+
+        def capture_rollout(current_cycle_feature, rollout_cycle_h_t, rollout_cycle_c_t):
+            recorded_hidden.append(rollout_cycle_h_t.detach().clone())
+            return original_rollout(
+                current_cycle_feature,
+                rollout_cycle_h_t,
+                rollout_cycle_c_t,
+            )
+
+        with mock.patch.object(
+            self.model,
+            "rollout_cycle_step",
+            side_effect=capture_rollout,
+        ):
+            self.model(
+                self.obs_traj_rel,
+                self.obs_traj,
+                self.obs_state,
+                self.pred_state,
+                self.seq_start_end,
+                traffic_context=traffic_context,
+            )
+
+        self.assertEqual(self.model.pred_len, len(recorded_hidden))
+        base_cycle_hidden = self.model.debug_last_aux["cycle_hidden_last"]
+        self.assertTrue(torch.allclose(recorded_hidden[0], base_cycle_hidden))
+        self.assertFalse(torch.allclose(recorded_hidden[1], base_cycle_hidden))
+        self.assertFalse(torch.allclose(recorded_hidden[1], recorded_hidden[0]))
+
     def test_training_rollout_step_zero_uses_last_observed_offset(self):
         traffic_context = self.model.build_traffic_context(
             self.obs_traj_rel,
@@ -380,6 +426,73 @@ class CycleStateProtocolTest(unittest.TestCase):
         observed_distance = (step0_decode_context - observed_queue_context).norm(dim=1)
         rollout_distance = (rollout_queue_context - observed_queue_context).norm(dim=1)
         self.assertTrue(torch.all(observed_distance < rollout_distance))
+
+    def test_rollout_cycle_context_is_used_by_decoder_state_residual(self):
+        model = models.CycleStateTrajectoryGenerator(
+            obs_len=8,
+            pred_len=12,
+            traj_lstm_input_size=2,
+            traj_lstm_hidden_size=32,
+            n_units=[32, 16, 32],
+            n_heads=[4, 1],
+            graph_network_out_dims=32,
+            dropout=0.0,
+            alpha=0.2,
+            graph_lstm_hidden_size=32,
+            noise_dim=(16,),
+            noise_type="gaussian",
+            disable_state_gating=True,
+        )
+        traffic_context = model.build_traffic_context(
+            self.obs_traj_rel,
+            self.obs_traj,
+            self.obs_state,
+            self.pred_state,
+            self.seq_start_end,
+        )
+        recorded_cycle_contexts = []
+        original_build_residual = model.build_decoder_state_residual
+        synthetic_cycle_hidden = torch.full(
+            (self.obs_traj.shape[1], model.cycle_lstm_hidden_size),
+            0.25,
+        )
+
+        def fake_cycle_rollout(current_cycle_feature, rollout_cycle_h_t, rollout_cycle_c_t):
+            return {
+                "cycle_hidden": synthetic_cycle_hidden,
+                "cycle_cell": torch.zeros_like(synthetic_cycle_hidden),
+            }
+
+        def capture_cycle_context(light_state_embedding, queue_context, cycle_context):
+            recorded_cycle_contexts.append(cycle_context.detach().clone())
+            return original_build_residual(
+                light_state_embedding,
+                queue_context,
+                cycle_context,
+            )
+
+        with mock.patch.object(
+            model,
+            "rollout_cycle_step",
+            side_effect=fake_cycle_rollout,
+        ):
+            with mock.patch.object(
+                model,
+                "build_decoder_state_residual",
+                side_effect=capture_cycle_context,
+            ):
+                model(
+                    self.obs_traj_rel,
+                    self.obs_traj,
+                    self.obs_state,
+                    self.pred_state,
+                    self.seq_start_end,
+                    traffic_context=traffic_context,
+                )
+
+        self.assertGreaterEqual(len(recorded_cycle_contexts), 2)
+        step0_cycle_context = recorded_cycle_contexts[1]
+        self.assertTrue(torch.allclose(step0_cycle_context, synthetic_cycle_hidden))
 
     def test_rollout_residual_scale_zero_keeps_observed_queue_context(self):
         bounded_model = models.CycleStateTrajectoryGenerator(
@@ -5469,6 +5582,80 @@ class CycleStateProtocolTest(unittest.TestCase):
                 "queue_distance_norm": 500.0,
                 "cycle_time_norm": 60.0,
             },
+        )
+
+    def test_evaluate_get_generator_accepts_legacy_single_aux_head_checkpoint(self):
+        """旧 CycleState checkpoint 使用 ``queue_aux_head`` / ``cycle_aux_head``
+        单头结构时，评估侧也必须能兼容加载，而不是直接 load_state_dict 失败。"""
+        checkpoint = {
+            "state_dict": self.model.state_dict(),
+        }
+        queue_head = torch.nn.Linear(self.model.queue_lstm_hidden_size, 6)
+        cycle_head = torch.nn.Linear(self.model.cycle_lstm_hidden_size, 6)
+        checkpoint["state_dict"].pop("queue_aux_reg_head.weight")
+        checkpoint["state_dict"].pop("queue_aux_reg_head.bias")
+        checkpoint["state_dict"].pop("queue_aux_cls_head.weight")
+        checkpoint["state_dict"].pop("queue_aux_cls_head.bias")
+        checkpoint["state_dict"].pop("cycle_aux_phase_head.weight")
+        checkpoint["state_dict"].pop("cycle_aux_phase_head.bias")
+        checkpoint["state_dict"].pop("cycle_aux_time_head.weight")
+        checkpoint["state_dict"].pop("cycle_aux_time_head.bias")
+        checkpoint["state_dict"].pop("cycle_aux_change_head.weight")
+        checkpoint["state_dict"].pop("cycle_aux_change_head.bias")
+        checkpoint["state_dict"]["queue_aux_head.weight"] = queue_head.weight.detach().clone()
+        checkpoint["state_dict"]["queue_aux_head.bias"] = queue_head.bias.detach().clone()
+        checkpoint["state_dict"]["cycle_aux_head.weight"] = cycle_head.weight.detach().clone()
+        checkpoint["state_dict"]["cycle_aux_head.bias"] = cycle_head.bias.detach().clone()
+
+        eval_args = SimpleNamespace(
+            obs_len=8,
+            pred_len=12,
+            traj_lstm_input_size=2,
+            traj_lstm_hidden_size=32,
+            hidden_units="16",
+            heads="4,1",
+            graph_network_out_dims=32,
+            dropout=0.0,
+            alpha=0.2,
+            graph_lstm_hidden_size=32,
+            noise_dim=(16,),
+            noise_type="gaussian",
+            model_type="cyclestate",
+            disable_state_gating=False,
+            disable_queue_rollout=False,
+            disable_lane_queue_anchor=False,
+            disable_decoder_state_residual=False,
+            disable_aux_losses=False,
+            rollout_residual_scale=1.0,
+            detach_rollout_state=False,
+            phase_duration_limits=None,
+            rollout_queue_coefs_json="",
+            device="cpu",
+            num_samples=20,
+        )
+
+        with mock.patch.object(evaluate_model, "args", eval_args, create=True):
+            restored_model = evaluate_model.get_generator(checkpoint)
+
+        torch.testing.assert_close(
+            restored_model.queue_aux_reg_head.weight,
+            queue_head.weight[:4],
+        )
+        torch.testing.assert_close(
+            restored_model.queue_aux_cls_head.weight,
+            queue_head.weight[4:],
+        )
+        torch.testing.assert_close(
+            restored_model.cycle_aux_phase_head.weight,
+            cycle_head.weight[:3],
+        )
+        torch.testing.assert_close(
+            restored_model.cycle_aux_time_head.weight,
+            cycle_head.weight[3:5],
+        )
+        torch.testing.assert_close(
+            restored_model.cycle_aux_change_head.weight,
+            cycle_head.weight[5:6],
         )
 
     def test_train_source_writes_norm_params_to_both_checkpoint_dicts(self):

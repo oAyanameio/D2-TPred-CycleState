@@ -1331,9 +1331,47 @@ def compute_best_of_k_metric_sums(
 def maybe_load_compatible_weights(model, state_dict):
     """尽量复用旧 checkpoint 中与当前模型形状兼容的参数。"""
     model_state = model.state_dict()
+    legacy_state = dict(state_dict)
+
+    # Phase 6 #45: 兼容旧版单头 aux checkpoint。
+    # 旧 CycleState 使用:
+    #   queue_aux_head: 6 = [4 reg, 2 cls]
+    #   cycle_aux_head: 6 = [3 phase, 2 time, 1 change]
+    # 新版拆成独立子头后,加载侧需要显式做一次按槽位切分,否则
+    # evaluate/train 都会因为 missing/unexpected keys 直接失败。
+    queue_weight = legacy_state.pop("queue_aux_head.weight", None)
+    queue_bias = legacy_state.pop("queue_aux_head.bias", None)
+    if queue_weight is not None and queue_bias is not None:
+        legacy_state.setdefault("queue_aux_reg_head.weight", queue_weight[:4].clone())
+        legacy_state.setdefault("queue_aux_reg_head.bias", queue_bias[:4].clone())
+        legacy_state.setdefault("queue_aux_cls_head.weight", queue_weight[4:].clone())
+        legacy_state.setdefault("queue_aux_cls_head.bias", queue_bias[4:].clone())
+
+    cycle_weight = legacy_state.pop("cycle_aux_head.weight", None)
+    cycle_bias = legacy_state.pop("cycle_aux_head.bias", None)
+    if cycle_weight is not None and cycle_bias is not None:
+        legacy_state.setdefault(
+            "cycle_aux_phase_head.weight", cycle_weight[:3].clone()
+        )
+        legacy_state.setdefault(
+            "cycle_aux_phase_head.bias", cycle_bias[:3].clone()
+        )
+        legacy_state.setdefault(
+            "cycle_aux_time_head.weight", cycle_weight[3:5].clone()
+        )
+        legacy_state.setdefault(
+            "cycle_aux_time_head.bias", cycle_bias[3:5].clone()
+        )
+        legacy_state.setdefault(
+            "cycle_aux_change_head.weight", cycle_weight[5:6].clone()
+        )
+        legacy_state.setdefault(
+            "cycle_aux_change_head.bias", cycle_bias[5:6].clone()
+        )
+
     compatible_state = {}
     skipped = []
-    for key, value in state_dict.items():
+    for key, value in legacy_state.items():
         if key in model_state and model_state[key].shape == value.shape:
             compatible_state[key] = value
         else:
