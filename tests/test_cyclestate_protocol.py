@@ -1890,7 +1890,7 @@ class CycleStateProtocolTest(unittest.TestCase):
             "state_loss must not be called anywhere in train.py. Active "
             "training uses compute_structured_aux_losses. If you intend to "
             "wire state_loss into the live training path, first re-validate "
-            "its loss_mask dependency and update PLAN.md §2.1.",
+            "its loss_mask dependency and update docs/PLAN.md.",
         )
 
     # --- #4 P0 fix: cycle/queue aux head subspace split ---

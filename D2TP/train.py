@@ -886,7 +886,7 @@ def compute_structured_aux_losses(
       跨步稳定性, 仅取末帧监督 rollout 等于砍掉 11/12 的信号。
 
     任何把 main aux 改成"全序列监督"或把 rollout aux 改成"末帧监督"
-    的重构都必须显式记录在 PLAN.md §2.4, 否则 :func:`tests.test_cyclestate_protocol`
+    的重构都必须显式记录在 ``docs/PLAN.md`` 的活跃 backlog 中, 否则 :func:`tests.test_cyclestate_protocol`
     中 ``test_train_call_site_uses_last_frame_for_main_and_sequence_for_rollout``
     会失败。
 

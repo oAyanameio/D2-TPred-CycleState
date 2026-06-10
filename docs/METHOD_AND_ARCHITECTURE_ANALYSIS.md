@@ -1,24 +1,18 @@
 # METHOD_AND_ARCHITECTURE_ANALYSIS
 
-本文件是方法与结构层问题索引，占位补齐现有文档系统中的 `MA` 交叉引用。
+本文件只作为方法与结构问题索引落点保留。
 
-## 作用
+## 当前职责
 
-- 作为 [PLAN.md](./PLAN.md) 中 `MA` 来源缩写的落点文档。
-- 汇总 `CycleState` 在方法论、结构设计、容量与实验设计上的问题。
-- 与 [ENGINEERING_ISSUES.md](./ENGINEERING_ISSUES.md)、[COMPREHENSIVE_ANALYSIS.md](./COMPREHENSIVE_ANALYSIS.md)、[../EXPERIMENT_LOG.md](../EXPERIMENT_LOG.md) 形成交叉引用。
+- 标记方法论与结构设计问题的统一入口
+- 为仓库内已有交叉引用提供稳定落点
 
-## 当前状态
+## 应看哪里
 
-- `G1-G8` 条目当前仍在 [PLAN.md §1 主问题交叉索引](./PLAN.md#1-主问题交叉索引) 与 Phase 章节中维护。
-- 运行证据与阶段结论见 [../EXPERIMENT_LOG.md](../EXPERIMENT_LOG.md)。
-- 更完整的研究叙事说明见 [cyclestate_research_story.md](./cyclestate_research_story.md)。
+- 活跃 backlog（含 `G3-G8` 与 `Phase 0.5`）：[`docs/PLAN.md`](./PLAN.md)
+- 当前主线与结论：[`../README.md`](../README.md) 与 [`../EXPERIMENT_LOG.md`](../EXPERIMENT_LOG.md)
+- 代码结构与入口：[`technical_documentation.md`](./technical_documentation.md)
 
-## 后续迁移建议
+## 维护规则
 
-后续可按以下维度整理：
-
-1. 状态分支容量与表达能力
-2. rollout / decoder 注入设计
-3. 消融设计与公平性
-4. oracle 假设与真实部署差距
+这里不再展开长篇研究故事；方法问题的现状以 live plan 为准。

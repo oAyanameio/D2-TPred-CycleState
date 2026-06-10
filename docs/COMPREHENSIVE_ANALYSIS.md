@@ -1,24 +1,18 @@
 # COMPREHENSIVE_ANALYSIS
 
-本文件是综合问题分析索引，占位补齐现有文档系统中的 `CA` 交叉引用。
+本文件只作为综合问题索引落点保留。
 
-## 作用
+## 当前职责
 
-- 作为 [PLAN.md](./PLAN.md) 中 `CA` 来源缩写的落点文档。
-- 汇总工程、实验、协议与文档层面的综合问题。
-- 与 [ENGINEERING_ISSUES.md](./ENGINEERING_ISSUES.md)、[METHOD_AND_ARCHITECTURE_ANALYSIS.md](./METHOD_AND_ARCHITECTURE_ANALYSIS.md)、[../EXPERIMENT_LOG.md](../EXPERIMENT_LOG.md) 保持双向跳转。
+- 标记跨工程、实验、文档与流程问题的统一入口
+- 为仓库内已有交叉引用提供稳定落点
 
-## 当前状态
+## 应看哪里
 
-- 当前综合问题仍主要维护在 [PLAN.md §1 主问题交叉索引](./PLAN.md#1-主问题交叉索引)。
-- 实验结果与阶段性验收记录见 [../EXPERIMENT_LOG.md](../EXPERIMENT_LOG.md)。
-- 研究叙事与实现结构背景见 [cyclestate_research_story.md](./cyclestate_research_story.md) 与 [technical_documentation.md](./technical_documentation.md)。
+- 活跃未解决项：[`docs/PLAN.md`](./PLAN.md)
+- 当前结论与可比证据：[`../EXPERIMENT_LOG.md`](../EXPERIMENT_LOG.md)
+- 架构与实现背景：[`technical_documentation.md`](./technical_documentation.md)
 
-## 后续迁移建议
+## 维护规则
 
-建议后续将 `CA` 条目按以下块拆分：
-
-1. 代码正确性
-2. 训练协议
-3. 实验体系
-4. 文档与可维护性
+这里不再维护长分析正文；综合问题以 live plan 和当前证据为准。
