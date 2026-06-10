@@ -9,6 +9,7 @@ from data.loader import data_loader
 from models import (
     TrajectoryGenerator,
     CycleStateTrajectoryGenerator,
+    AblationConfig,
     RolloutQueueCoefs,
     apply_rollout_coefs_override,
 )
@@ -230,13 +231,11 @@ def get_generator(checkpoint):
         noise_type=args.noise_type,
     )
     if args.model_type == "cyclestate":
-        model_kwargs["disable_state_gating"] = args.disable_state_gating
-        model_kwargs["disable_queue_rollout"] = args.disable_queue_rollout
-        model_kwargs["disable_lane_queue_anchor"] = args.disable_lane_queue_anchor
-        model_kwargs["disable_decoder_state_residual"] = (
-            args.disable_decoder_state_residual
-        )
-        model_kwargs["disable_aux_losses"] = args.disable_aux_losses
+        # Phase 4 #22/#31: ``to_model_kwargs()`` 会把 "disable_aux_losses"
+        # 及四个子开关一起从 ``args.disable_aux_losses`` / ``args.disable_*``
+        # 集中映射到模型构造参数，避免 train/eval 两侧再手写一份散落透传逻辑。
+        ablation_cfg = AblationConfig.from_args(args)
+        model_kwargs.update(ablation_cfg.to_model_kwargs())
         model_kwargs["rollout_residual_scale"] = args.rollout_residual_scale
         model_kwargs["detach_rollout_state"] = args.detach_rollout_state
         # Phase 3 #23: 把 ``--phase_duration_limits`` 透传到模型构造函数;

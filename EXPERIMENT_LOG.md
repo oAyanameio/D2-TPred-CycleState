@@ -3,6 +3,7 @@
 > **精简时间**: 2026-06-07 18:30
 > **覆盖范围**: 全部 protocol-check 与 comparable 实验
 > **历史详情**: 早期 Stage 1-23 的中间过程已沉淀到 [PLAN.md](./PLAN.md) 与 [docs/technical_documentation.md](./docs/technical_documentation.md)，本日志只保留**当前结论、最强证据、推荐下一步**
+> **问题索引**: 工程/综合/方法论问题来源分别见 [docs/ENGINEERING_ISSUES.md](./docs/ENGINEERING_ISSUES.md)、[docs/COMPREHENSIVE_ANALYSIS.md](./docs/COMPREHENSIVE_ANALYSIS.md)、[docs/METHOD_AND_ARCHITECTURE_ANALYSIS.md](./docs/METHOD_AND_ARCHITECTURE_ANALYSIS.md)。
 
 ---
 

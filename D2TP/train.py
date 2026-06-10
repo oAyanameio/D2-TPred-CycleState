@@ -23,6 +23,7 @@ from models import (
     TrajectoryGenerator,
     TrajectoryDiscriminator,
     CycleStateTrajectoryGenerator,
+    AblationConfig,
     RolloutQueueCoefs,
     apply_rollout_coefs_override,
 )
@@ -1423,13 +1424,8 @@ def main(args):
         noise_type=args.noise_type,
     )
     if args.model_type == "cyclestate":
-        model_kwargs["disable_state_gating"] = args.disable_state_gating
-        model_kwargs["disable_queue_rollout"] = args.disable_queue_rollout
-        model_kwargs["disable_lane_queue_anchor"] = args.disable_lane_queue_anchor
-        model_kwargs["disable_decoder_state_residual"] = (
-            args.disable_decoder_state_residual
-        )
-        model_kwargs["disable_aux_losses"] = args.disable_aux_losses
+        ablation_cfg = AblationConfig.from_args(args)
+        model_kwargs.update(ablation_cfg.to_model_kwargs())
         model_kwargs["rollout_residual_scale"] = args.rollout_residual_scale
         model_kwargs["detach_rollout_state"] = args.detach_rollout_state
         # Phase 3 #23: 把 ``--phase_duration_limits`` 透传到模型构造函数;
@@ -1467,13 +1463,15 @@ def main(args):
     # Phase 4 #22: 日志口径必须反映 ``disable_aux_losses=True`` 强制开启四个子开关
     # 之后的"模型实际生效状态", 而不是原始 ``args.disable_*``。这样才能保证消融实验
     # 日志与运行时的真实行为一致, 满足可审计性。
-    _disable_aux = bool(getattr(args, "disable_aux_losses", False))
-    _eff_disable_state_gating = _disable_aux or bool(args.disable_state_gating)
-    _eff_disable_queue_rollout = _disable_aux or bool(args.disable_queue_rollout)
-    _eff_disable_lane_queue_anchor = _disable_aux or bool(args.disable_lane_queue_anchor)
-    _eff_disable_decoder_state_residual = _disable_aux or bool(
-        args.disable_decoder_state_residual
-    )
+    ablation_cfg = AblationConfig.from_args(args)
+    _disable_aux = ablation_cfg.disable_aux_losses
+    _effective_ablation = ablation_cfg.effective_flags()
+    _eff_disable_state_gating = _effective_ablation["disable_state_gating"]
+    _eff_disable_queue_rollout = _effective_ablation["disable_queue_rollout"]
+    _eff_disable_lane_queue_anchor = _effective_ablation["disable_lane_queue_anchor"]
+    _eff_disable_decoder_state_residual = _effective_ablation[
+        "disable_decoder_state_residual"
+    ]
     logging.info(
         "Training protocol | model_type=%s stage=%s val_split=%s lr=%.6f grad_clip=%.3f generator_only=%s gan_weight=%.3f aux_queue=%.3f aux_rollout=%.3f aux_cycle=%.3f rollout_residual_scale=%.3f detach_rollout_state=%s phase_duration_limits=%s disable_state_gating(eff)=%s disable_queue_rollout(eff)=%s disable_lane_queue_anchor(eff)=%s disable_decoder_state_residual(eff)=%s disable_aux_losses=%s teacher_forcing=%.3f",
         args.model_type,

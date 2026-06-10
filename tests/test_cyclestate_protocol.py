@@ -5,6 +5,7 @@ import pathlib
 import random
 import re
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -5328,6 +5329,148 @@ class CycleStateProtocolTest(unittest.TestCase):
         self.model.load_norm_params(original)
         self.assertEqual(self.model.norm_params(), original)
 
+    def test_norm_params_payload_uses_plain_python_floats(self):
+        """#29: ``norm_params()`` 应稳定导出 plain ``float`` 负载。"""
+        self.model.queue_count_norm = np.float32(12.5)
+        self.model.queue_speed_norm = np.float64(7.25)
+        self.model.queue_distance_norm = torch.tensor(321.0)
+        self.model.cycle_time_norm = 88
+
+        payload = self.model.norm_params()
+
+        for key, value in payload.items():
+            self.assertIsInstance(
+                value,
+                float,
+                f"{key} 应导出为 plain float，避免 checkpoint 负载类型漂移",
+            )
+        self.assertEqual(payload["queue_count_norm"], 12.5)
+        self.assertEqual(payload["queue_speed_norm"], 7.25)
+        self.assertEqual(payload["queue_distance_norm"], 321.0)
+        self.assertEqual(payload["cycle_time_norm"], 88.0)
+
+    def test_norm_params_checkpoint_roundtrip_via_torch_save_load(self):
+        """#29: ``torch.save/load`` 后仍可恢复归一化参数。"""
+        expected = {
+            "queue_count_norm": 21.0,
+            "queue_speed_norm": 17.5,
+            "queue_distance_norm": 275.0,
+            "cycle_time_norm": 95.0,
+        }
+        checkpoint = {
+            "state_dict": self.model.state_dict(),
+            "norm_params": expected,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt_path = pathlib.Path(tmpdir) / "norm_params_roundtrip.pth"
+            torch.save(checkpoint, ckpt_path)
+            loaded = torch.load(ckpt_path, map_location="cpu")
+
+        restored_model = models.CycleStateTrajectoryGenerator(
+            obs_len=8,
+            pred_len=12,
+            traj_lstm_input_size=2,
+            traj_lstm_hidden_size=32,
+            n_units=[32, 16, 32],
+            n_heads=[4, 1],
+            graph_network_out_dims=32,
+            dropout=0.0,
+            alpha=0.2,
+            graph_lstm_hidden_size=32,
+            noise_dim=(16,),
+            noise_type="gaussian",
+        )
+        restored_model.load_norm_params(loaded["norm_params"])
+        self.assertEqual(restored_model.norm_params(), expected)
+
+    def test_evaluate_get_generator_restores_norm_params_from_checkpoint(self):
+        """#29: evaluate 路径应从 checkpoint 恢复归一化参数。"""
+        expected = {
+            "queue_count_norm": 33.0,
+            "queue_speed_norm": 14.0,
+            "queue_distance_norm": 410.0,
+            "cycle_time_norm": 72.0,
+        }
+        checkpoint = {
+            "state_dict": self.model.state_dict(),
+            "norm_params": expected,
+        }
+        eval_args = SimpleNamespace(
+            obs_len=8,
+            pred_len=12,
+            traj_lstm_input_size=2,
+            traj_lstm_hidden_size=32,
+            hidden_units="16",
+            heads="4,1",
+            graph_network_out_dims=32,
+            dropout=0.0,
+            alpha=0.2,
+            graph_lstm_hidden_size=32,
+            noise_dim=(16,),
+            noise_type="gaussian",
+            model_type="cyclestate",
+            disable_state_gating=False,
+            disable_queue_rollout=False,
+            disable_lane_queue_anchor=False,
+            disable_decoder_state_residual=False,
+            disable_aux_losses=False,
+            rollout_residual_scale=1.0,
+            detach_rollout_state=False,
+            phase_duration_limits=None,
+            rollout_queue_coefs_json="",
+            device="cpu",
+        )
+
+        with mock.patch.object(evaluate_model, "args", eval_args, create=True):
+            restored_model = evaluate_model.get_generator(checkpoint)
+
+        self.assertEqual(restored_model.norm_params(), expected)
+
+    def test_evaluate_get_generator_keeps_defaults_for_legacy_checkpoint(self):
+        """#29: 旧 checkpoint 缺失 ``norm_params`` 时应保持默认值。"""
+        checkpoint = {
+            "state_dict": self.model.state_dict(),
+        }
+        eval_args = SimpleNamespace(
+            obs_len=8,
+            pred_len=12,
+            traj_lstm_input_size=2,
+            traj_lstm_hidden_size=32,
+            hidden_units="16",
+            heads="4,1",
+            graph_network_out_dims=32,
+            dropout=0.0,
+            alpha=0.2,
+            graph_lstm_hidden_size=32,
+            noise_dim=(16,),
+            noise_type="gaussian",
+            model_type="cyclestate",
+            disable_state_gating=False,
+            disable_queue_rollout=False,
+            disable_lane_queue_anchor=False,
+            disable_decoder_state_residual=False,
+            disable_aux_losses=False,
+            rollout_residual_scale=1.0,
+            detach_rollout_state=False,
+            phase_duration_limits=None,
+            rollout_queue_coefs_json="",
+            device="cpu",
+        )
+
+        with mock.patch.object(evaluate_model, "args", eval_args, create=True):
+            restored_model = evaluate_model.get_generator(checkpoint)
+
+        self.assertEqual(
+            restored_model.norm_params(),
+            {
+                "queue_count_norm": 10.0,
+                "queue_speed_norm": 10.0,
+                "queue_distance_norm": 500.0,
+                "cycle_time_norm": 60.0,
+            },
+        )
+
     def test_train_source_writes_norm_params_to_both_checkpoint_dicts(self):
         """#29: train.py 的两个 ``save_checkpoint`` 都应包含
         ``norm_params`` 键。"""
@@ -5357,6 +5500,160 @@ class CycleStateProtocolTest(unittest.TestCase):
             eval_source,
             "evaluate_model.py 应恢复 checkpoint 中的归一化参数",
         )
+
+    # ------------------------------------------------------------------
+    # Phase 5 #30 修复: ``add_noise`` 噪声采样抽象
+    # ------------------------------------------------------------------
+    def test_build_noise_sampler_returns_expected_concrete_type(self):
+        """#30: 字符串噪声类型应解析为稳定的 sampler 对象。"""
+        gaussian = models.build_noise_sampler("gaussian")
+        uniform = models.build_noise_sampler("uniform")
+
+        self.assertIsInstance(gaussian, models.GaussianNoiseSampler)
+        self.assertIsInstance(uniform, models.UniformNoiseSampler)
+        self.assertEqual("gaussian", gaussian.name)
+        self.assertEqual("uniform", uniform.name)
+
+    def test_build_noise_sampler_rejects_unknown_noise_type(self):
+        """#30: 未知噪声类型应在 factory 层抛错。"""
+        with self.assertRaises(ValueError) as cm:
+            models.build_noise_sampler("triangular")
+        self.assertIn("triangular", str(cm.exception))
+
+    def test_trajectory_generator_accepts_noise_sampler_instance(self):
+        """#30: 生成器应接受 sampler 实例，而非只支持字符串。"""
+
+        class RecordingNoiseSampler(models.NoiseSampler):
+            name = "recording"
+
+            def __init__(self):
+                self.calls = []
+
+            def sample(self, shape, device):
+                self.calls.append((tuple(shape), str(device)))
+                return torch.ones(*shape, device=device)
+
+        sampler = RecordingNoiseSampler()
+        model = models.TrajectoryGenerator(
+            obs_len=8,
+            pred_len=12,
+            traj_lstm_input_size=2,
+            traj_lstm_hidden_size=32,
+            n_units=[32, 16, 32],
+            n_heads=[4, 1],
+            graph_network_out_dims=32,
+            dropout=0.0,
+            alpha=0.2,
+            graph_lstm_hidden_size=32,
+            noise_dim=(16,),
+            noise_type=sampler,
+        )
+        hidden_wo_noise = torch.zeros(
+            self.obs_traj.size(1),
+            model.light_embedding_size
+            + model.traj_lstm_hidden_size
+            + model.graph_lstm_hidden_size,
+        )
+
+        hidden_with_noise = model.add_noise(hidden_wo_noise, self.seq_start_end)
+
+        self.assertIs(model.noise_sampler, sampler)
+        self.assertEqual("recording", model.noise_type)
+        self.assertEqual(1, len(sampler.calls))
+        self.assertTrue(torch.all(hidden_with_noise[:, -model.noise_dim[0] :] == 1.0))
+
+    def test_get_noise_accepts_noise_sampler_instance(self):
+        """#30: ``get_noise`` 应支持 sampler 实例输入。"""
+
+        class ConstantNoiseSampler(models.NoiseSampler):
+            name = "constant"
+
+            def sample(self, shape, device):
+                return torch.full(shape, 0.25, device=device)
+
+        noise = models.get_noise((2, 3), ConstantNoiseSampler(), torch.device("cpu"))
+        self.assertEqual((2, 3), tuple(noise.shape))
+        self.assertTrue(torch.allclose(noise, torch.full((2, 3), 0.25)))
+
+    # ------------------------------------------------------------------
+    # Phase 5 #32/#33 修复: 文档交叉引用 + 端到端脚本
+    # ------------------------------------------------------------------
+    def test_analysis_issue_docs_exist(self):
+        """#32: 三份分析/问题索引文档应实际存在。"""
+        for rel_path in (
+            "docs/ENGINEERING_ISSUES.md",
+            "docs/COMPREHENSIVE_ANALYSIS.md",
+            "docs/METHOD_AND_ARCHITECTURE_ANALYSIS.md",
+        ):
+            self.assertTrue(
+                (REPO_ROOT / rel_path).is_file(),
+                f"{rel_path} 应存在，避免 PLAN/EXPERIMENT_LOG 链接悬空",
+            )
+
+    def test_experiment_log_links_analysis_issue_docs(self):
+        """#32: EXPERIMENT_LOG 应显式链接三份分析文档。"""
+        experiment_log = (REPO_ROOT / "EXPERIMENT_LOG.md").read_text(encoding="utf-8")
+        self.assertIn("docs/ENGINEERING_ISSUES.md", experiment_log)
+        self.assertIn("docs/COMPREHENSIVE_ANALYSIS.md", experiment_log)
+        self.assertIn("docs/METHOD_AND_ARCHITECTURE_ANALYSIS.md", experiment_log)
+
+    def test_run_full_pipeline_script_exists(self):
+        """#33: 应提供 `scripts/run_full_pipeline.sh`。"""
+        self.assertTrue(
+            (REPO_ROOT / "scripts" / "run_full_pipeline.sh").is_file(),
+            "缺少 scripts/run_full_pipeline.sh",
+        )
+
+    def test_run_full_pipeline_script_wires_train_and_evaluate(self):
+        """#33: pipeline 脚本应串起 train 与 evaluate。"""
+        script = (REPO_ROOT / "scripts" / "run_full_pipeline.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("D2TP/train.py", script)
+        self.assertIn("D2TP/evaluate_model.py", script)
+        self.assertIn("model_best.pth.tar", script)
+        self.assertIn("MAX_TRAIN_BATCHES", script)
+        self.assertIn("MAX_VAL_BATCHES", script)
+
+    # ------------------------------------------------------------------
+    # Phase 4 #31 修复: disable_* 开关集中注册
+    # ------------------------------------------------------------------
+    def test_ablation_config_dataclass_exists(self):
+        """#31: 应存在集中管理 disable_* 开关的 dataclass。"""
+        self.assertTrue(hasattr(models, "AblationConfig"))
+        cfg = models.AblationConfig()
+        self.assertFalse(cfg.disable_state_gating)
+        self.assertFalse(cfg.disable_queue_rollout)
+        self.assertFalse(cfg.disable_lane_queue_anchor)
+        self.assertFalse(cfg.disable_decoder_state_residual)
+        self.assertFalse(cfg.disable_aux_losses)
+
+    def test_ablation_config_from_args_applies_disable_aux_losses(self):
+        """#31: 集中配置应统一计算 effective disable 状态。"""
+        args = SimpleNamespace(
+            disable_state_gating=False,
+            disable_queue_rollout=False,
+            disable_lane_queue_anchor=False,
+            disable_decoder_state_residual=False,
+            disable_aux_losses=True,
+        )
+        cfg = models.AblationConfig.from_args(args)
+        eff = cfg.effective_flags()
+        self.assertTrue(eff["disable_state_gating"])
+        self.assertTrue(eff["disable_queue_rollout"])
+        self.assertTrue(eff["disable_lane_queue_anchor"])
+        self.assertTrue(eff["disable_decoder_state_residual"])
+
+    def test_train_and_evaluate_use_shared_ablation_config_helper(self):
+        """#31: train/evaluate 应复用同一 helper，而不是散落手写传参。"""
+        train_source = (REPO_ROOT / "D2TP" / "train.py").read_text(encoding="utf-8")
+        eval_source = (REPO_ROOT / "D2TP" / "evaluate_model.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("AblationConfig", train_source)
+        self.assertIn("AblationConfig", eval_source)
+        self.assertIn("to_model_kwargs()", train_source)
+        self.assertIn("to_model_kwargs()", eval_source)
 
 
 if __name__ == "__main__":
