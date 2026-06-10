@@ -93,14 +93,14 @@ Run: `experiments/cyclestate/warmup50_refine50_p0_seqgat_relation_v1`
 2. baseline `test + num_samples=20`
 3. 当前最佳候选 `test + num_samples=20`
 
-如果第 3 步成立，再按下面顺序做单变量消融：
+完成这三步后，优先按下面顺序做诊断式单变量消融：
 
 1. `disable_queue_rollout`
 2. `disable_decoder_state_residual`
-3. `disable_lane_queue_anchor`
-4. `disable_state_gating`
+3. `disable_state_gating`
+4. `disable_lane_queue_anchor`
 
-如果第 3 步不成立，优先回到协议正确性与状态进入预测期的稳定性，不要继续试：
+如果第 3 步不成立，优先回到预测期状态路径与协议稳定性，不要继续试：
 
 - 单独 warmup `teacher_forcing_ratio`
 - 同一轮混改多个大变量

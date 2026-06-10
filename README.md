@@ -113,5 +113,5 @@ python D2TP/evaluate_model.py \
 
 1. 补齐 baseline 的 `val/test + num_samples=20` 可比线。
 2. 复核 `warmup50_refine50_p0_seqgat_relation_v1` 在 `test + num_samples=20` 上是否成立。
-3. 如果候选站得住，再按 `queue rollout -> decoder residual -> lane anchor -> state gating`
-   顺序做单变量消融。
+3. 在口径补齐后，优先按 `queue rollout -> decoder residual -> state gating -> lane anchor`
+   做诊断式单变量消融；如果证据显示问题集中在预测期 cycle path，再优先回到该路径而不是继续扫 warmup 超参。
