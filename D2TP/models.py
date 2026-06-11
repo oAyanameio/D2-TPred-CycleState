@@ -1090,6 +1090,7 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         disable_decoder_state_residual=False,
         disable_aux_losses=False,
         rollout_residual_scale=1.0,
+        decoder_state_residual_scale=1.0,
         detach_rollout_state=False,
         rollout_queue_coefs=None,
     ):
@@ -1147,6 +1148,7 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         self.disable_lane_queue_anchor = disable_lane_queue_anchor
         self.disable_decoder_state_residual = disable_decoder_state_residual
         self.rollout_residual_scale = rollout_residual_scale
+        self.decoder_state_residual_scale = decoder_state_residual_scale
         self.detach_rollout_state = detach_rollout_state
         # Phase 3 #16: 把 ``rollout_queue_features`` 内的硬编码物理系数集中到
         # ``RolloutQueueCoefs`` dataclass,默认 ``None`` 触发 dataclass 默认值,
@@ -1964,7 +1966,7 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         )
         state_residual = self.decoder_state_residual(decoder_state_context)
         state_gate = self.decoder_state_gate(decoder_state_context)
-        return state_gate * state_residual
+        return self.decoder_state_residual_scale * state_gate * state_residual
 
     def build_rollout_decode_queue_context(
         self,

@@ -222,6 +222,12 @@ parser.add_argument(
     type=float,
     help="CycleState rollout queue delta 注入 decoder 的缩放系数。",
 )
+parser.add_argument(
+    "--decoder_state_residual_scale",
+    default=None,
+    type=float,
+    help="CycleState decoder state residual 注入 decoder hidden 的缩放系数。",
+)
 # Phase 3 #16: 把 ``rollout_queue_features`` 内 hardcoded 的物理系数集中到
 # ``RolloutQueueCoefs`` dataclass 后,允许通过 JSON 字符串做部分字段覆盖。
 # JSON 字段名与 ``models.RolloutQueueCoefs`` 字段名一一对应,例如
@@ -523,6 +529,7 @@ TRAIN_STAGE_DEFAULTS = {
         "teacher_forcing_ratio": 0.8,
         "grad_clip": 1.0,
         "rollout_residual_scale": 0.35,
+        "decoder_state_residual_scale": 1.0,
         "detach_rollout_state": True,
     },
     "refine": {
@@ -533,6 +540,7 @@ TRAIN_STAGE_DEFAULTS = {
         "teacher_forcing_ratio": 0.6,
         "grad_clip": 1.0,
         "rollout_residual_scale": 0.7,
+        "decoder_state_residual_scale": 1.0,
         "detach_rollout_state": False,
     },
     "adversarial": {
@@ -543,6 +551,7 @@ TRAIN_STAGE_DEFAULTS = {
         "teacher_forcing_ratio": 0.4,
         "grad_clip": 1.0,
         "rollout_residual_scale": 0.7,
+        "decoder_state_residual_scale": 1.0,
         "detach_rollout_state": False,
     },
 }
@@ -555,6 +564,7 @@ BASELINE_DEFAULTS = {
     "teacher_forcing_ratio": 0.5,
     "grad_clip": 0.0,
     "rollout_residual_scale": 1.0,
+    "decoder_state_residual_scale": 1.0,
     "detach_rollout_state": False,
 }
 
@@ -1465,6 +1475,9 @@ def main(args):
         ablation_cfg = AblationConfig.from_args(args)
         model_kwargs.update(ablation_cfg.to_model_kwargs())
         model_kwargs["rollout_residual_scale"] = args.rollout_residual_scale
+        model_kwargs["decoder_state_residual_scale"] = (
+            args.decoder_state_residual_scale
+        )
         model_kwargs["detach_rollout_state"] = args.detach_rollout_state
         # Phase 3 #23: 把 ``--phase_duration_limits`` 透传到模型构造函数;
         # ``None`` 触发 ``__init__`` 默认值 ``(38.0, 47.0, 2.0)``, 与原硬编码

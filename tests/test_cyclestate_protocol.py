@@ -520,6 +520,30 @@ class CycleStateProtocolTest(unittest.TestCase):
 
         self.assertTrue(torch.allclose(decoded, observed))
 
+    def test_decoder_state_residual_scale_zero_disables_state_residual(self):
+        bounded_model = models.CycleStateTrajectoryGenerator(
+            obs_len=8,
+            pred_len=12,
+            traj_lstm_input_size=2,
+            traj_lstm_hidden_size=32,
+            n_units=[32, 16, 32],
+            n_heads=[4, 1],
+            graph_network_out_dims=32,
+            dropout=0.0,
+            alpha=0.2,
+            graph_lstm_hidden_size=32,
+            noise_dim=(16,),
+            noise_type="gaussian",
+            decoder_state_residual_scale=0.0,
+        )
+        light = torch.randn(3, bounded_model.light_embedding_size)
+        queue = torch.randn(3, bounded_model.queue_lstm_hidden_size)
+        cycle = torch.randn(3, bounded_model.cycle_lstm_hidden_size)
+
+        residual = bounded_model.build_decoder_state_residual(light, queue, cycle)
+
+        self.assertTrue(torch.allclose(residual, torch.zeros_like(residual)))
+
     def test_detach_rollout_state_keeps_outputs_but_cuts_cross_step_hidden_grad(self):
         detach_model = models.CycleStateTrajectoryGenerator(
             obs_len=8,
@@ -1517,6 +1541,7 @@ class CycleStateProtocolTest(unittest.TestCase):
             aux_cycle_weight=None,
             grad_clip=None,
             rollout_residual_scale=None,
+            decoder_state_residual_scale=None,
             detach_rollout_state=None,
         )
         train.apply_stage_defaults(args)
@@ -1526,6 +1551,7 @@ class CycleStateProtocolTest(unittest.TestCase):
         self.assertGreater(args.aux_cycle_weight, 0.0)
         self.assertGreater(args.grad_clip, 0.0)
         self.assertLess(args.rollout_residual_scale, 1.0)
+        self.assertEqual(1.0, args.decoder_state_residual_scale)
         self.assertTrue(args.detach_rollout_state)
 
     def test_explicit_stage_overrides_are_preserved_for_ablation(self):
@@ -1540,6 +1566,7 @@ class CycleStateProtocolTest(unittest.TestCase):
             teacher_forcing_ratio=0.6,
             grad_clip=0.0,
             rollout_residual_scale=0.75,
+            decoder_state_residual_scale=0.5,
             detach_rollout_state=False,
         )
         train.apply_stage_defaults(args)
@@ -1551,6 +1578,7 @@ class CycleStateProtocolTest(unittest.TestCase):
         self.assertEqual(0.6, args.teacher_forcing_ratio)
         self.assertEqual(0.0, args.grad_clip)
         self.assertEqual(0.75, args.rollout_residual_scale)
+        self.assertEqual(0.5, args.decoder_state_residual_scale)
         self.assertFalse(args.detach_rollout_state)
 
     def test_cyclestate_keeps_baseline_decoder_shapes_for_warm_start(self):
@@ -1785,6 +1813,17 @@ class CycleStateProtocolTest(unittest.TestCase):
         )
         self.assertEqual(0.35, args.rollout_residual_scale)
         self.assertTrue(args.detach_rollout_state)
+
+    def test_evaluate_parser_exposes_decoder_state_residual_scale(self):
+        args = evaluate_model.parser.parse_args(
+            [
+                "--model_type",
+                "cyclestate",
+                "--decoder_state_residual_scale",
+                "0.25",
+            ]
+        )
+        self.assertEqual(0.25, args.decoder_state_residual_scale)
 
     def test_evaluate_model_supports_max_eval_batches_and_weighted_averaging(self):
         batch = [
@@ -5529,6 +5568,7 @@ class CycleStateProtocolTest(unittest.TestCase):
             disable_decoder_state_residual=False,
             disable_aux_losses=False,
             rollout_residual_scale=1.0,
+            decoder_state_residual_scale=1.0,
             detach_rollout_state=False,
             phase_duration_limits=None,
             rollout_queue_coefs_json="",
@@ -5565,6 +5605,7 @@ class CycleStateProtocolTest(unittest.TestCase):
             disable_decoder_state_residual=False,
             disable_aux_losses=False,
             rollout_residual_scale=1.0,
+            decoder_state_residual_scale=1.0,
             detach_rollout_state=False,
             phase_duration_limits=None,
             rollout_queue_coefs_json="",

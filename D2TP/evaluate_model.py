@@ -105,6 +105,12 @@ parser.add_argument(
     type=float,
     help="CycleState rollout queue delta 注入 decoder 的缩放系数，需与训练 checkpoint 协议一致。",
 )
+parser.add_argument(
+    "--decoder_state_residual_scale",
+    default=1.0,
+    type=float,
+    help="CycleState decoder state residual 注入 decoder hidden 的缩放系数。",
+)
 # Phase 3 #16: 评估侧同样支持 ``--rollout_queue_coefs_json`` JSON 字符串覆盖,
 # 行为与 train.py 一致; 留空使用 ``RolloutQueueCoefs()`` 默认值, 与原硬编码兼容。
 parser.add_argument(
@@ -238,6 +244,9 @@ def get_generator(checkpoint):
         ablation_cfg = AblationConfig.from_args(args)
         model_kwargs.update(ablation_cfg.to_model_kwargs())
         model_kwargs["rollout_residual_scale"] = args.rollout_residual_scale
+        model_kwargs["decoder_state_residual_scale"] = (
+            getattr(args, "decoder_state_residual_scale", 1.0)
+        )
         model_kwargs["detach_rollout_state"] = args.detach_rollout_state
         # Phase 3 #23: 把 ``--phase_duration_limits`` 透传到模型构造函数;
         # ``None`` 触发 ``__init__`` 默认值, 与训练时的协议保持一致。
