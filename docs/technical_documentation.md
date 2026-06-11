@@ -70,7 +70,7 @@ CycleState 延续原始 `D2-TPred` 的微观轨迹与交互建模，并新增两
 
 ### 5.1 Oracle 信号假设
 
-CycleState 与 baseline 都把未来真实信号状态 `pred_state` 作为输入。当前 comparable 结果在这个假设上对齐，但它仍是需要单独讨论的限制条件。
+CycleState 与 baseline 都把未来真实信号状态 `pred_state` 作为输入。当前 comparable 结果在这个假设上对齐，但它仍是需要单独讨论的限制条件。其性能贡献已列入 `docs/PLAN.md` Phase 0.5 退化实验中量化；在决定性实验 DE-1（Oracle State 直注）完成后，大部分 Phase 0.5 的问题应有答案。
 
 ### 5.2 统一数据接口
 
@@ -81,6 +81,10 @@ CycleState 与 baseline 都把未来真实信号状态 `pred_state` 作为输入
 `disable_state_gating`、`disable_queue_rollout`、`disable_lane_queue_anchor`、
 `disable_decoder_state_residual`、`disable_aux_losses` 统一由 `models.AblationConfig`
 管理。train / evaluate / protocol-log 必须共用同一套语义。
+
+另外，`decoder_state_residual_scale` 是独立于 `AblationConfig` 的训练/推理旋钮
+（默认 `1.0`），用于控制 state residual 注入 decoder hidden 的强度。train 的 stage
+defaults 和 evaluate 的 CLI parser 均已补齐该字段，但需要显式覆盖。
 
 ### 5.4 rollout 系数只能走 `RolloutQueueCoefs`
 
@@ -93,6 +97,11 @@ queue rollout 的相位驱动系数、拼接权重、clamp 上界都集中在
 
 - `main aux`：末帧监督
 - `rollout aux`：全预测期序列监督
+
+**当前诊断提醒**：aux loss 权重（`aux_rollout_weight=2.5`）可能会驱动 state branch 学到
+对轨迹预测无帮助甚至有害的表征（"擅长预测排队长度"和"为轨迹预测提供有用表征"可能是
+正交甚至冲突的目标）。在决定性实验中，`aux_rollout_weight=0` 被作为关键对比条件之一。
+详见 `docs/PLAN.md` 第 2.4 节。
 
 如果要改这条约束，必须同步补测试并更新 `README.md` / `EXPERIMENT_LOG.md` / `docs/PLAN.md`。
 
@@ -127,7 +136,7 @@ python -m py_compile D2TP/train.py D2TP/models.py D2TP/evaluate_model.py
 
 ## 8. 文档分工
 
-- `README.md`：项目入口
-- `EXPERIMENT_LOG.md`：当前证据
-- `docs/PLAN.md`：活跃 backlog
+- `README.md`：项目入口、当前状态、可比证据、最小复现命令
+- `EXPERIMENT_LOG.md`：当前证据、决定��里程碑、推荐下一步
+- `docs/PLAN.md`：综合诊断、决定性实验设计、活跃 backlog、架构重设计、执行顺序
 - 本文档：实现结构与修改入口
