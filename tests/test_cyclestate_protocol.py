@@ -5,6 +5,7 @@ import pathlib
 import random
 import re
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -139,9 +140,14 @@ class CycleStateProtocolTest(unittest.TestCase):
         self.assertIn("queue_rollout_hidden_seq", self.model.debug_last_aux)
         self.assertIn("queue_rollout_pred_seq", self.model.debug_last_aux)
         self.assertIn("lane_queue_rollout_anchor_seq", self.model.debug_last_aux)
+        self.assertIn("cycle_rollout_hidden_seq", self.model.debug_last_aux)
         self.assertEqual(
             (12, 3, self.model.queue_lstm_hidden_size),
             tuple(self.model.debug_last_aux["queue_rollout_hidden_seq"].shape),
+        )
+        self.assertEqual(
+            (12, 3, self.model.cycle_lstm_hidden_size),
+            tuple(self.model.debug_last_aux["cycle_rollout_hidden_seq"].shape),
         )
         self.assertEqual(
             (12, 3, 6),
@@ -170,6 +176,8 @@ class CycleStateProtocolTest(unittest.TestCase):
         )
         queue_rollout = self.model.debug_last_aux["queue_rollout_hidden_seq"]
         self.assertFalse(torch.allclose(queue_rollout[0], queue_rollout[-1]))
+        cycle_rollout = self.model.debug_last_aux["cycle_rollout_hidden_seq"]
+        self.assertFalse(torch.allclose(cycle_rollout[0], cycle_rollout[-1]))
         lane_anchor_rollout = self.model.debug_last_aux["lane_queue_rollout_anchor_seq"]
         self.assertTrue(torch.allclose(lane_anchor_rollout[0, 0], lane_anchor_rollout[0, 1]))
         self.assertFalse(torch.allclose(lane_anchor_rollout[0, 0], lane_anchor_rollout[0, 2]))
@@ -296,6 +304,45 @@ class CycleStateProtocolTest(unittest.TestCase):
         self.assertFalse(torch.allclose(recorded_inputs[1], base_queue_feature))
         self.assertFalse(torch.allclose(recorded_inputs[1], recorded_inputs[0]))
 
+    def test_cycle_rollout_uses_previous_step_state(self):
+        traffic_context = self.model.build_traffic_context(
+            self.obs_traj_rel,
+            self.obs_traj,
+            self.obs_state,
+            self.pred_state,
+            self.seq_start_end,
+        )
+        recorded_hidden = []
+        original_rollout = self.model.rollout_cycle_step
+
+        def capture_rollout(current_cycle_feature, rollout_cycle_h_t, rollout_cycle_c_t):
+            recorded_hidden.append(rollout_cycle_h_t.detach().clone())
+            return original_rollout(
+                current_cycle_feature,
+                rollout_cycle_h_t,
+                rollout_cycle_c_t,
+            )
+
+        with mock.patch.object(
+            self.model,
+            "rollout_cycle_step",
+            side_effect=capture_rollout,
+        ):
+            self.model(
+                self.obs_traj_rel,
+                self.obs_traj,
+                self.obs_state,
+                self.pred_state,
+                self.seq_start_end,
+                traffic_context=traffic_context,
+            )
+
+        self.assertEqual(self.model.pred_len, len(recorded_hidden))
+        base_cycle_hidden = self.model.debug_last_aux["cycle_hidden_last"]
+        self.assertTrue(torch.allclose(recorded_hidden[0], base_cycle_hidden))
+        self.assertFalse(torch.allclose(recorded_hidden[1], base_cycle_hidden))
+        self.assertFalse(torch.allclose(recorded_hidden[1], recorded_hidden[0]))
+
     def test_training_rollout_step_zero_uses_last_observed_offset(self):
         traffic_context = self.model.build_traffic_context(
             self.obs_traj_rel,
@@ -380,6 +427,73 @@ class CycleStateProtocolTest(unittest.TestCase):
         rollout_distance = (rollout_queue_context - observed_queue_context).norm(dim=1)
         self.assertTrue(torch.all(observed_distance < rollout_distance))
 
+    def test_rollout_cycle_context_is_used_by_decoder_state_residual(self):
+        model = models.CycleStateTrajectoryGenerator(
+            obs_len=8,
+            pred_len=12,
+            traj_lstm_input_size=2,
+            traj_lstm_hidden_size=32,
+            n_units=[32, 16, 32],
+            n_heads=[4, 1],
+            graph_network_out_dims=32,
+            dropout=0.0,
+            alpha=0.2,
+            graph_lstm_hidden_size=32,
+            noise_dim=(16,),
+            noise_type="gaussian",
+            disable_state_gating=True,
+        )
+        traffic_context = model.build_traffic_context(
+            self.obs_traj_rel,
+            self.obs_traj,
+            self.obs_state,
+            self.pred_state,
+            self.seq_start_end,
+        )
+        recorded_cycle_contexts = []
+        original_build_residual = model.build_decoder_state_residual
+        synthetic_cycle_hidden = torch.full(
+            (self.obs_traj.shape[1], model.cycle_lstm_hidden_size),
+            0.25,
+        )
+
+        def fake_cycle_rollout(current_cycle_feature, rollout_cycle_h_t, rollout_cycle_c_t):
+            return {
+                "cycle_hidden": synthetic_cycle_hidden,
+                "cycle_cell": torch.zeros_like(synthetic_cycle_hidden),
+            }
+
+        def capture_cycle_context(light_state_embedding, queue_context, cycle_context):
+            recorded_cycle_contexts.append(cycle_context.detach().clone())
+            return original_build_residual(
+                light_state_embedding,
+                queue_context,
+                cycle_context,
+            )
+
+        with mock.patch.object(
+            model,
+            "rollout_cycle_step",
+            side_effect=fake_cycle_rollout,
+        ):
+            with mock.patch.object(
+                model,
+                "build_decoder_state_residual",
+                side_effect=capture_cycle_context,
+            ):
+                model(
+                    self.obs_traj_rel,
+                    self.obs_traj,
+                    self.obs_state,
+                    self.pred_state,
+                    self.seq_start_end,
+                    traffic_context=traffic_context,
+                )
+
+        self.assertGreaterEqual(len(recorded_cycle_contexts), 2)
+        step0_cycle_context = recorded_cycle_contexts[1]
+        self.assertTrue(torch.allclose(step0_cycle_context, synthetic_cycle_hidden))
+
     def test_rollout_residual_scale_zero_keeps_observed_queue_context(self):
         bounded_model = models.CycleStateTrajectoryGenerator(
             obs_len=8,
@@ -405,6 +519,30 @@ class CycleStateProtocolTest(unittest.TestCase):
         )
 
         self.assertTrue(torch.allclose(decoded, observed))
+
+    def test_decoder_state_residual_scale_zero_disables_state_residual(self):
+        bounded_model = models.CycleStateTrajectoryGenerator(
+            obs_len=8,
+            pred_len=12,
+            traj_lstm_input_size=2,
+            traj_lstm_hidden_size=32,
+            n_units=[32, 16, 32],
+            n_heads=[4, 1],
+            graph_network_out_dims=32,
+            dropout=0.0,
+            alpha=0.2,
+            graph_lstm_hidden_size=32,
+            noise_dim=(16,),
+            noise_type="gaussian",
+            decoder_state_residual_scale=0.0,
+        )
+        light = torch.randn(3, bounded_model.light_embedding_size)
+        queue = torch.randn(3, bounded_model.queue_lstm_hidden_size)
+        cycle = torch.randn(3, bounded_model.cycle_lstm_hidden_size)
+
+        residual = bounded_model.build_decoder_state_residual(light, queue, cycle)
+
+        self.assertTrue(torch.allclose(residual, torch.zeros_like(residual)))
 
     def test_detach_rollout_state_keeps_outputs_but_cuts_cross_step_hidden_grad(self):
         detach_model = models.CycleStateTrajectoryGenerator(
@@ -1403,6 +1541,7 @@ class CycleStateProtocolTest(unittest.TestCase):
             aux_cycle_weight=None,
             grad_clip=None,
             rollout_residual_scale=None,
+            decoder_state_residual_scale=None,
             detach_rollout_state=None,
         )
         train.apply_stage_defaults(args)
@@ -1412,6 +1551,7 @@ class CycleStateProtocolTest(unittest.TestCase):
         self.assertGreater(args.aux_cycle_weight, 0.0)
         self.assertGreater(args.grad_clip, 0.0)
         self.assertLess(args.rollout_residual_scale, 1.0)
+        self.assertEqual(1.0, args.decoder_state_residual_scale)
         self.assertTrue(args.detach_rollout_state)
 
     def test_explicit_stage_overrides_are_preserved_for_ablation(self):
@@ -1426,6 +1566,7 @@ class CycleStateProtocolTest(unittest.TestCase):
             teacher_forcing_ratio=0.6,
             grad_clip=0.0,
             rollout_residual_scale=0.75,
+            decoder_state_residual_scale=0.5,
             detach_rollout_state=False,
         )
         train.apply_stage_defaults(args)
@@ -1437,6 +1578,7 @@ class CycleStateProtocolTest(unittest.TestCase):
         self.assertEqual(0.6, args.teacher_forcing_ratio)
         self.assertEqual(0.0, args.grad_clip)
         self.assertEqual(0.75, args.rollout_residual_scale)
+        self.assertEqual(0.5, args.decoder_state_residual_scale)
         self.assertFalse(args.detach_rollout_state)
 
     def test_cyclestate_keeps_baseline_decoder_shapes_for_warm_start(self):
@@ -1672,6 +1814,17 @@ class CycleStateProtocolTest(unittest.TestCase):
         self.assertEqual(0.35, args.rollout_residual_scale)
         self.assertTrue(args.detach_rollout_state)
 
+    def test_evaluate_parser_exposes_decoder_state_residual_scale(self):
+        args = evaluate_model.parser.parse_args(
+            [
+                "--model_type",
+                "cyclestate",
+                "--decoder_state_residual_scale",
+                "0.25",
+            ]
+        )
+        self.assertEqual(0.25, args.decoder_state_residual_scale)
+
     def test_evaluate_model_supports_max_eval_batches_and_weighted_averaging(self):
         batch = [
             torch.zeros(8, 2, 10),
@@ -1889,7 +2042,7 @@ class CycleStateProtocolTest(unittest.TestCase):
             "state_loss must not be called anywhere in train.py. Active "
             "training uses compute_structured_aux_losses. If you intend to "
             "wire state_loss into the live training path, first re-validate "
-            "its loss_mask dependency and update PLAN.md §2.1.",
+            "its loss_mask dependency and update docs/PLAN.md.",
         )
 
     # --- #4 P0 fix: cycle/queue aux head subspace split ---
@@ -5328,6 +5481,224 @@ class CycleStateProtocolTest(unittest.TestCase):
         self.model.load_norm_params(original)
         self.assertEqual(self.model.norm_params(), original)
 
+    def test_norm_params_payload_uses_plain_python_floats(self):
+        """#29: ``norm_params()`` 应稳定导出 plain ``float`` 负载。"""
+        self.model.queue_count_norm = np.float32(12.5)
+        self.model.queue_speed_norm = np.float64(7.25)
+        self.model.queue_distance_norm = torch.tensor(321.0)
+        self.model.cycle_time_norm = 88
+
+        payload = self.model.norm_params()
+
+        for key, value in payload.items():
+            self.assertIsInstance(
+                value,
+                float,
+                f"{key} 应导出为 plain float，避免 checkpoint 负载类型漂移",
+            )
+        self.assertEqual(payload["queue_count_norm"], 12.5)
+        self.assertEqual(payload["queue_speed_norm"], 7.25)
+        self.assertEqual(payload["queue_distance_norm"], 321.0)
+        self.assertEqual(payload["cycle_time_norm"], 88.0)
+
+    def test_norm_params_checkpoint_roundtrip_via_torch_save_load(self):
+        """#29: ``torch.save/load`` 后仍可恢复归一化参数。"""
+        expected = {
+            "queue_count_norm": 21.0,
+            "queue_speed_norm": 17.5,
+            "queue_distance_norm": 275.0,
+            "cycle_time_norm": 95.0,
+        }
+        checkpoint = {
+            "state_dict": self.model.state_dict(),
+            "norm_params": expected,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt_path = pathlib.Path(tmpdir) / "norm_params_roundtrip.pth"
+            torch.save(checkpoint, ckpt_path)
+            loaded = torch.load(ckpt_path, map_location="cpu")
+
+        restored_model = models.CycleStateTrajectoryGenerator(
+            obs_len=8,
+            pred_len=12,
+            traj_lstm_input_size=2,
+            traj_lstm_hidden_size=32,
+            n_units=[32, 16, 32],
+            n_heads=[4, 1],
+            graph_network_out_dims=32,
+            dropout=0.0,
+            alpha=0.2,
+            graph_lstm_hidden_size=32,
+            noise_dim=(16,),
+            noise_type="gaussian",
+        )
+        restored_model.load_norm_params(loaded["norm_params"])
+        self.assertEqual(restored_model.norm_params(), expected)
+
+    def test_evaluate_get_generator_restores_norm_params_from_checkpoint(self):
+        """#29: evaluate 路径应从 checkpoint 恢复归一化参数。"""
+        expected = {
+            "queue_count_norm": 33.0,
+            "queue_speed_norm": 14.0,
+            "queue_distance_norm": 410.0,
+            "cycle_time_norm": 72.0,
+        }
+        checkpoint = {
+            "state_dict": self.model.state_dict(),
+            "norm_params": expected,
+        }
+        eval_args = SimpleNamespace(
+            obs_len=8,
+            pred_len=12,
+            traj_lstm_input_size=2,
+            traj_lstm_hidden_size=32,
+            hidden_units="16",
+            heads="4,1",
+            graph_network_out_dims=32,
+            dropout=0.0,
+            alpha=0.2,
+            graph_lstm_hidden_size=32,
+            noise_dim=(16,),
+            noise_type="gaussian",
+            model_type="cyclestate",
+            disable_state_gating=False,
+            disable_queue_rollout=False,
+            disable_lane_queue_anchor=False,
+            disable_decoder_state_residual=False,
+            disable_aux_losses=False,
+            rollout_residual_scale=1.0,
+            decoder_state_residual_scale=1.0,
+            detach_rollout_state=False,
+            phase_duration_limits=None,
+            rollout_queue_coefs_json="",
+            device="cpu",
+        )
+
+        with mock.patch.object(evaluate_model, "args", eval_args, create=True):
+            restored_model = evaluate_model.get_generator(checkpoint)
+
+        self.assertEqual(restored_model.norm_params(), expected)
+
+    def test_evaluate_get_generator_keeps_defaults_for_legacy_checkpoint(self):
+        """#29: 旧 checkpoint 缺失 ``norm_params`` 时应保持默认值。"""
+        checkpoint = {
+            "state_dict": self.model.state_dict(),
+        }
+        eval_args = SimpleNamespace(
+            obs_len=8,
+            pred_len=12,
+            traj_lstm_input_size=2,
+            traj_lstm_hidden_size=32,
+            hidden_units="16",
+            heads="4,1",
+            graph_network_out_dims=32,
+            dropout=0.0,
+            alpha=0.2,
+            graph_lstm_hidden_size=32,
+            noise_dim=(16,),
+            noise_type="gaussian",
+            model_type="cyclestate",
+            disable_state_gating=False,
+            disable_queue_rollout=False,
+            disable_lane_queue_anchor=False,
+            disable_decoder_state_residual=False,
+            disable_aux_losses=False,
+            rollout_residual_scale=1.0,
+            decoder_state_residual_scale=1.0,
+            detach_rollout_state=False,
+            phase_duration_limits=None,
+            rollout_queue_coefs_json="",
+            device="cpu",
+        )
+
+        with mock.patch.object(evaluate_model, "args", eval_args, create=True):
+            restored_model = evaluate_model.get_generator(checkpoint)
+
+        self.assertEqual(
+            restored_model.norm_params(),
+            {
+                "queue_count_norm": 10.0,
+                "queue_speed_norm": 10.0,
+                "queue_distance_norm": 500.0,
+                "cycle_time_norm": 60.0,
+            },
+        )
+
+    def test_evaluate_get_generator_accepts_legacy_single_aux_head_checkpoint(self):
+        """旧 CycleState checkpoint 使用 ``queue_aux_head`` / ``cycle_aux_head``
+        单头结构时，评估侧也必须能兼容加载，而不是直接 load_state_dict 失败。"""
+        checkpoint = {
+            "state_dict": self.model.state_dict(),
+        }
+        queue_head = torch.nn.Linear(self.model.queue_lstm_hidden_size, 6)
+        cycle_head = torch.nn.Linear(self.model.cycle_lstm_hidden_size, 6)
+        checkpoint["state_dict"].pop("queue_aux_reg_head.weight")
+        checkpoint["state_dict"].pop("queue_aux_reg_head.bias")
+        checkpoint["state_dict"].pop("queue_aux_cls_head.weight")
+        checkpoint["state_dict"].pop("queue_aux_cls_head.bias")
+        checkpoint["state_dict"].pop("cycle_aux_phase_head.weight")
+        checkpoint["state_dict"].pop("cycle_aux_phase_head.bias")
+        checkpoint["state_dict"].pop("cycle_aux_time_head.weight")
+        checkpoint["state_dict"].pop("cycle_aux_time_head.bias")
+        checkpoint["state_dict"].pop("cycle_aux_change_head.weight")
+        checkpoint["state_dict"].pop("cycle_aux_change_head.bias")
+        checkpoint["state_dict"]["queue_aux_head.weight"] = queue_head.weight.detach().clone()
+        checkpoint["state_dict"]["queue_aux_head.bias"] = queue_head.bias.detach().clone()
+        checkpoint["state_dict"]["cycle_aux_head.weight"] = cycle_head.weight.detach().clone()
+        checkpoint["state_dict"]["cycle_aux_head.bias"] = cycle_head.bias.detach().clone()
+
+        eval_args = SimpleNamespace(
+            obs_len=8,
+            pred_len=12,
+            traj_lstm_input_size=2,
+            traj_lstm_hidden_size=32,
+            hidden_units="16",
+            heads="4,1",
+            graph_network_out_dims=32,
+            dropout=0.0,
+            alpha=0.2,
+            graph_lstm_hidden_size=32,
+            noise_dim=(16,),
+            noise_type="gaussian",
+            model_type="cyclestate",
+            disable_state_gating=False,
+            disable_queue_rollout=False,
+            disable_lane_queue_anchor=False,
+            disable_decoder_state_residual=False,
+            disable_aux_losses=False,
+            rollout_residual_scale=1.0,
+            detach_rollout_state=False,
+            phase_duration_limits=None,
+            rollout_queue_coefs_json="",
+            device="cpu",
+            num_samples=20,
+        )
+
+        with mock.patch.object(evaluate_model, "args", eval_args, create=True):
+            restored_model = evaluate_model.get_generator(checkpoint)
+
+        torch.testing.assert_close(
+            restored_model.queue_aux_reg_head.weight,
+            queue_head.weight[:4],
+        )
+        torch.testing.assert_close(
+            restored_model.queue_aux_cls_head.weight,
+            queue_head.weight[4:],
+        )
+        torch.testing.assert_close(
+            restored_model.cycle_aux_phase_head.weight,
+            cycle_head.weight[:3],
+        )
+        torch.testing.assert_close(
+            restored_model.cycle_aux_time_head.weight,
+            cycle_head.weight[3:5],
+        )
+        torch.testing.assert_close(
+            restored_model.cycle_aux_change_head.weight,
+            cycle_head.weight[5:6],
+        )
+
     def test_train_source_writes_norm_params_to_both_checkpoint_dicts(self):
         """#29: train.py 的两个 ``save_checkpoint`` 都应包含
         ``norm_params`` 键。"""
@@ -5357,6 +5728,160 @@ class CycleStateProtocolTest(unittest.TestCase):
             eval_source,
             "evaluate_model.py 应恢复 checkpoint 中的归一化参数",
         )
+
+    # ------------------------------------------------------------------
+    # Phase 5 #30 修复: ``add_noise`` 噪声采样抽象
+    # ------------------------------------------------------------------
+    def test_build_noise_sampler_returns_expected_concrete_type(self):
+        """#30: 字符串噪声类型应解析为稳定的 sampler 对象。"""
+        gaussian = models.build_noise_sampler("gaussian")
+        uniform = models.build_noise_sampler("uniform")
+
+        self.assertIsInstance(gaussian, models.GaussianNoiseSampler)
+        self.assertIsInstance(uniform, models.UniformNoiseSampler)
+        self.assertEqual("gaussian", gaussian.name)
+        self.assertEqual("uniform", uniform.name)
+
+    def test_build_noise_sampler_rejects_unknown_noise_type(self):
+        """#30: 未知噪声类型应在 factory 层抛错。"""
+        with self.assertRaises(ValueError) as cm:
+            models.build_noise_sampler("triangular")
+        self.assertIn("triangular", str(cm.exception))
+
+    def test_trajectory_generator_accepts_noise_sampler_instance(self):
+        """#30: 生成器应接受 sampler 实例，而非只支持字符串。"""
+
+        class RecordingNoiseSampler(models.NoiseSampler):
+            name = "recording"
+
+            def __init__(self):
+                self.calls = []
+
+            def sample(self, shape, device):
+                self.calls.append((tuple(shape), str(device)))
+                return torch.ones(*shape, device=device)
+
+        sampler = RecordingNoiseSampler()
+        model = models.TrajectoryGenerator(
+            obs_len=8,
+            pred_len=12,
+            traj_lstm_input_size=2,
+            traj_lstm_hidden_size=32,
+            n_units=[32, 16, 32],
+            n_heads=[4, 1],
+            graph_network_out_dims=32,
+            dropout=0.0,
+            alpha=0.2,
+            graph_lstm_hidden_size=32,
+            noise_dim=(16,),
+            noise_type=sampler,
+        )
+        hidden_wo_noise = torch.zeros(
+            self.obs_traj.size(1),
+            model.light_embedding_size
+            + model.traj_lstm_hidden_size
+            + model.graph_lstm_hidden_size,
+        )
+
+        hidden_with_noise = model.add_noise(hidden_wo_noise, self.seq_start_end)
+
+        self.assertIs(model.noise_sampler, sampler)
+        self.assertEqual("recording", model.noise_type)
+        self.assertEqual(1, len(sampler.calls))
+        self.assertTrue(torch.all(hidden_with_noise[:, -model.noise_dim[0] :] == 1.0))
+
+    def test_get_noise_accepts_noise_sampler_instance(self):
+        """#30: ``get_noise`` 应支持 sampler 实例输入。"""
+
+        class ConstantNoiseSampler(models.NoiseSampler):
+            name = "constant"
+
+            def sample(self, shape, device):
+                return torch.full(shape, 0.25, device=device)
+
+        noise = models.get_noise((2, 3), ConstantNoiseSampler(), torch.device("cpu"))
+        self.assertEqual((2, 3), tuple(noise.shape))
+        self.assertTrue(torch.allclose(noise, torch.full((2, 3), 0.25)))
+
+    # ------------------------------------------------------------------
+    # Phase 5 #32/#33 修复: 文档交叉引用 + 端到端脚本
+    # ------------------------------------------------------------------
+    def test_analysis_issue_docs_exist(self):
+        """#32: 三份分析/问题索引文档应实际存在。"""
+        for rel_path in (
+            "docs/ENGINEERING_ISSUES.md",
+            "docs/COMPREHENSIVE_ANALYSIS.md",
+            "docs/METHOD_AND_ARCHITECTURE_ANALYSIS.md",
+        ):
+            self.assertTrue(
+                (REPO_ROOT / rel_path).is_file(),
+                f"{rel_path} 应存在，避免 PLAN/EXPERIMENT_LOG 链接悬空",
+            )
+
+    def test_experiment_log_links_analysis_issue_docs(self):
+        """#32: EXPERIMENT_LOG 应显式链接三份分析文档。"""
+        experiment_log = (REPO_ROOT / "EXPERIMENT_LOG.md").read_text(encoding="utf-8")
+        self.assertIn("docs/ENGINEERING_ISSUES.md", experiment_log)
+        self.assertIn("docs/COMPREHENSIVE_ANALYSIS.md", experiment_log)
+        self.assertIn("docs/METHOD_AND_ARCHITECTURE_ANALYSIS.md", experiment_log)
+
+    def test_run_full_pipeline_script_exists(self):
+        """#33: 应提供 `scripts/run_full_pipeline.sh`。"""
+        self.assertTrue(
+            (REPO_ROOT / "scripts" / "run_full_pipeline.sh").is_file(),
+            "缺少 scripts/run_full_pipeline.sh",
+        )
+
+    def test_run_full_pipeline_script_wires_train_and_evaluate(self):
+        """#33: pipeline 脚本应串起 train 与 evaluate。"""
+        script = (REPO_ROOT / "scripts" / "run_full_pipeline.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("D2TP/train.py", script)
+        self.assertIn("D2TP/evaluate_model.py", script)
+        self.assertIn("model_best.pth.tar", script)
+        self.assertIn("MAX_TRAIN_BATCHES", script)
+        self.assertIn("MAX_VAL_BATCHES", script)
+
+    # ------------------------------------------------------------------
+    # Phase 4 #31 修复: disable_* 开关集中注册
+    # ------------------------------------------------------------------
+    def test_ablation_config_dataclass_exists(self):
+        """#31: 应存在集中管理 disable_* 开关的 dataclass。"""
+        self.assertTrue(hasattr(models, "AblationConfig"))
+        cfg = models.AblationConfig()
+        self.assertFalse(cfg.disable_state_gating)
+        self.assertFalse(cfg.disable_queue_rollout)
+        self.assertFalse(cfg.disable_lane_queue_anchor)
+        self.assertFalse(cfg.disable_decoder_state_residual)
+        self.assertFalse(cfg.disable_aux_losses)
+
+    def test_ablation_config_from_args_applies_disable_aux_losses(self):
+        """#31: 集中配置应统一计算 effective disable 状态。"""
+        args = SimpleNamespace(
+            disable_state_gating=False,
+            disable_queue_rollout=False,
+            disable_lane_queue_anchor=False,
+            disable_decoder_state_residual=False,
+            disable_aux_losses=True,
+        )
+        cfg = models.AblationConfig.from_args(args)
+        eff = cfg.effective_flags()
+        self.assertTrue(eff["disable_state_gating"])
+        self.assertTrue(eff["disable_queue_rollout"])
+        self.assertTrue(eff["disable_lane_queue_anchor"])
+        self.assertTrue(eff["disable_decoder_state_residual"])
+
+    def test_train_and_evaluate_use_shared_ablation_config_helper(self):
+        """#31: train/evaluate 应复用同一 helper，而不是散落手写传参。"""
+        train_source = (REPO_ROOT / "D2TP" / "train.py").read_text(encoding="utf-8")
+        eval_source = (REPO_ROOT / "D2TP" / "evaluate_model.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("AblationConfig", train_source)
+        self.assertIn("AblationConfig", eval_source)
+        self.assertIn("to_model_kwargs()", train_source)
+        self.assertIn("to_model_kwargs()", eval_source)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from abc import ABC, abstractmethod
 
 # from scipy import stats
 from utils import relative_to_abs
@@ -101,6 +102,92 @@ class RolloutQueueCoefs:
     lane_mean_speed_max: float = 1.5
 
 
+@dataclass(frozen=True)
+class AblationConfig:
+    """Phase 4 #31: 集中管理 CycleState 的 disable_* 开关。"""
+
+    disable_state_gating: bool = False
+    disable_queue_rollout: bool = False
+    disable_lane_queue_anchor: bool = False
+    disable_decoder_state_residual: bool = False
+    disable_aux_losses: bool = False
+
+    @classmethod
+    def from_args(cls, args):
+        return cls(
+            disable_state_gating=bool(getattr(args, "disable_state_gating", False)),
+            disable_queue_rollout=bool(getattr(args, "disable_queue_rollout", False)),
+            disable_lane_queue_anchor=bool(
+                getattr(args, "disable_lane_queue_anchor", False)
+            ),
+            disable_decoder_state_residual=bool(
+                getattr(args, "disable_decoder_state_residual", False)
+            ),
+            disable_aux_losses=bool(getattr(args, "disable_aux_losses", False)),
+        )
+
+    def effective_flags(self):
+        force_all = self.disable_aux_losses
+        return {
+            "disable_state_gating": force_all or self.disable_state_gating,
+            "disable_queue_rollout": force_all or self.disable_queue_rollout,
+            "disable_lane_queue_anchor": force_all or self.disable_lane_queue_anchor,
+            "disable_decoder_state_residual": (
+                force_all or self.disable_decoder_state_residual
+            ),
+        }
+
+    def to_model_kwargs(self):
+        return {
+            **self.effective_flags(),
+            "disable_aux_losses": self.disable_aux_losses,
+        }
+
+
+class NoiseSampler(ABC):
+    """噪声采样抽象。
+
+    Phase 5 #30: 用显式 sampler 对象替代 ``noise_type`` 字符串分发，
+    让调用方既可继续传 `"gaussian"` / `"uniform"` 保持兼容，也可传
+    自定义 sampler 实例，避免噪声策略扩展时把条件分支散落到模型里。
+    """
+
+    name = "unknown"
+
+    @abstractmethod
+    def sample(self, shape, device):
+        """返回位于 ``device`` 上、形状为 ``shape`` 的噪声张量。"""
+
+
+class GaussianNoiseSampler(NoiseSampler):
+    """标准高斯噪声。"""
+
+    name = "gaussian"
+
+    def sample(self, shape, device):
+        return torch.randn(*shape, device=device)
+
+
+class UniformNoiseSampler(NoiseSampler):
+    """[-1, 1] 均匀噪声。"""
+
+    name = "uniform"
+
+    def sample(self, shape, device):
+        return torch.rand(*shape, device=device).sub_(0.5).mul_(2.0)
+
+
+def build_noise_sampler(noise_type):
+    """把历史 ``noise_type`` 配置解析为 ``NoiseSampler`` 实例。"""
+    if isinstance(noise_type, NoiseSampler):
+        return noise_type
+    if noise_type == "gaussian":
+        return GaussianNoiseSampler()
+    if noise_type == "uniform":
+        return UniformNoiseSampler()
+    raise ValueError('Unrecognized noise type "%s"' % noise_type)
+
+
 def apply_rollout_coefs_override(base, override_dict):
     """Phase 3 #16:从 ``override_dict`` (例如 CLI 解析的 JSON) 中挑选 ``base``
     ``RolloutQueueCoefs`` 上存在的字段做 ``dataclasses.replace`` 合并。
@@ -148,11 +235,8 @@ def get_noise(shape, noise_type, device):
     Returns:
         位于指定设备上的随机噪声张量。
     """
-    if noise_type == "gaussian":
-        return torch.randn(*shape, device=device)
-    elif noise_type == "uniform":
-        return torch.rand(*shape, device=device).sub_(0.5).mul_(2.0)
-    raise ValueError('Unrecognized noise type "%s"' % noise_type)
+    sampler = build_noise_sampler(noise_type)
+    return sampler.sample(shape, device)
 
 
 def get_module_device(module):
@@ -658,7 +742,8 @@ class TrajectoryGenerator(nn.Module):
         self.pred_hidden2pos = nn.Linear(self.light_embedding_size + self.pred_lstm_hidden_size, 2)
 
         self.noise_dim = noise_dim
-        self.noise_type = noise_type
+        self.noise_sampler = build_noise_sampler(noise_type)
+        self.noise_type = self.noise_sampler.name
 
         # 解码器：每一步输入上一时刻位移，输出新的隐状态。
         self.pred_lstm_model = nn.LSTMCell(traj_lstm_input_size, self.pred_lstm_hidden_size)
@@ -725,7 +810,7 @@ class TrajectoryGenerator(nn.Module):
         """
         noise_shape = (seq_start_end.size(0),) + self.noise_dim
 
-        z_decoder = get_noise(noise_shape, self.noise_type, _input.device)
+        z_decoder = get_noise(noise_shape, self.noise_sampler, _input.device)
         expanded_noise = self.expand_scene_noise_to_batch(z_decoder, seq_start_end)
         return torch.cat([_input, expanded_noise], dim=1)
 
@@ -748,7 +833,7 @@ class TrajectoryGenerator(nn.Module):
             return pred_lstm_hidden
         step_noise = get_noise(
             (seq_start_end.size(0),) + self.noise_dim,
-            self.noise_type,
+            self.noise_sampler,
             pred_lstm_hidden.device,
         )
         expanded_noise = self.expand_scene_noise_to_batch(step_noise, seq_start_end)
@@ -1005,6 +1090,7 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         disable_decoder_state_residual=False,
         disable_aux_losses=False,
         rollout_residual_scale=1.0,
+        decoder_state_residual_scale=1.0,
         detach_rollout_state=False,
         rollout_queue_coefs=None,
     ):
@@ -1062,6 +1148,7 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         self.disable_lane_queue_anchor = disable_lane_queue_anchor
         self.disable_decoder_state_residual = disable_decoder_state_residual
         self.rollout_residual_scale = rollout_residual_scale
+        self.decoder_state_residual_scale = decoder_state_residual_scale
         self.detach_rollout_state = detach_rollout_state
         # Phase 3 #16: 把 ``rollout_queue_features`` 内的硬编码物理系数集中到
         # ``RolloutQueueCoefs`` dataclass,默认 ``None`` 触发 dataclass 默认值,
@@ -1231,7 +1318,7 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         Returns:
             dict[str, float]: 四个归一化参数。
         """
-        return {key: getattr(self, key) for key in self._norm_param_keys}
+        return {key: float(getattr(self, key)) for key in self._norm_param_keys}
 
     def load_norm_params(self, norm_dict):
         """从 checkpoint 恢复归一化参数。
@@ -1707,6 +1794,27 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         cycle_step_embedding = self.cycle_step_embedding(current_cycle_feature)
         return light_state_embedding, current_cycle_feature, cycle_step_embedding
 
+    def rollout_cycle_step(
+        self,
+        current_cycle_feature,
+        rollout_cycle_h_t,
+        rollout_cycle_c_t,
+    ):
+        """在预测期滚动更新 cycle hidden/cell。
+
+        G6 的最小方案不是再造一套显式 signal dynamics，而是让观测期已经学到的
+        cycle LSTM 在预测期继续前进。这样 decoder 读到的是“滚动后的 cycle
+        memory”，而不是每一步都重新从单帧 feature 投影出一个静态条件。
+        """
+        cycle_rollout_embed = self.cycle_feature_embedding(current_cycle_feature)
+        rollout_cycle_h_t, rollout_cycle_c_t = self.cycle_lstm_model(
+            cycle_rollout_embed, (rollout_cycle_h_t, rollout_cycle_c_t)
+        )
+        return {
+            "cycle_hidden": rollout_cycle_h_t,
+            "cycle_cell": rollout_cycle_c_t,
+        }
+
     def rollout_queue_step(
         self,
         prev_queue_feature,
@@ -1858,7 +1966,7 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         )
         state_residual = self.decoder_state_residual(decoder_state_context)
         state_gate = self.decoder_state_gate(decoder_state_context)
-        return state_gate * state_residual
+        return self.decoder_state_residual_scale * state_gate * state_residual
 
     def build_rollout_decode_queue_context(
         self,
@@ -1906,6 +2014,16 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
             rollout_queue_c_t.detach(),
         )
 
+    def maybe_detach_cycle_rollout_state(
+        self,
+        rollout_cycle_h_t,
+        rollout_cycle_c_t,
+    ):
+        """warmup 阶段按需截断预测期 macro rollout 跨步反传。"""
+        if not self.detach_rollout_state or not self.training:
+            return rollout_cycle_h_t, rollout_cycle_c_t
+        return rollout_cycle_h_t.detach(), rollout_cycle_c_t.detach()
+
     def forward(
         self,
         obs_traj_rel,
@@ -1949,6 +2067,8 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
             "queue_rollout_feature_seq": None,
             "queue_rollout_pred_seq": None,
             "queue_rollout_target_seq": None,
+            "cycle_rollout_hidden_seq": None,
+            "cycle_decode_context_seq": None,
             "lane_queue_rollout_anchor_seq": None,
             "decoder_state_init_residual": None,
             "decoder_state_init_residual_norm": None,
@@ -2059,11 +2179,15 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         queue_rollout_feature_seq = []
         queue_rollout_pred_seq = []
         queue_rollout_target_seq = []
+        cycle_rollout_hidden_seq = []
+        cycle_decode_context_seq = []
         lane_queue_rollout_anchor_seq = []
         queue_decode_context_seq = []
         decoder_state_residual_seq = []
         rollout_queue_h_t = gated_queue_last
         rollout_queue_c_t = torch.zeros_like(gated_queue_last)
+        rollout_cycle_h_t = gated_cycle_last
+        rollout_cycle_c_t = cycle_lstm_c_t
         rollout_queue_feature = queue_feature_seq[-1]
         rollout_lane_queue_anchor = lane_queue_anchor_seq[-1]
         rollout_lane_ids = traffic_context["agent"]["lane_ids"][-1]
@@ -2092,6 +2216,26 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                     obs_state,
                     pred_state,
                 )
+                if not self.disable_aux_losses:
+                    rollout_cycle_info = self.rollout_cycle_step(
+                        current_cycle_feature,
+                        rollout_cycle_h_t,
+                        rollout_cycle_c_t,
+                    )
+                    rollout_cycle_h_t = rollout_cycle_info["cycle_hidden"]
+                    rollout_cycle_c_t = rollout_cycle_info["cycle_cell"]
+                    cycle_context_for_decode = rollout_cycle_h_t
+                    if not self.disable_state_gating:
+                        cycle_context_for_decode = cycle_context_for_decode * self.decode_cycle_gate(
+                            torch.cat(
+                                (light_state_embedding, cycle_context_for_decode),
+                                dim=1,
+                            )
+                        )
+                    cycle_rollout_hidden_seq.append(rollout_cycle_h_t)
+                    cycle_decode_context_seq.append(cycle_context_for_decode)
+                else:
+                    cycle_context_for_decode = cycle_step_embedding
                 if not self.disable_queue_rollout:
                     rollout_info = self.rollout_queue_step(
                         rollout_queue_feature,
@@ -2135,16 +2279,18 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                         rollout_queue_h_t,
                         rollout_queue_c_t,
                     )
+                    rollout_cycle_h_t, rollout_cycle_c_t = (
+                        self.maybe_detach_cycle_rollout_state(
+                            rollout_cycle_h_t,
+                            rollout_cycle_c_t,
+                        )
+                    )
                 else:
                     queue_context_for_decode = gated_queue_last
-                if not self.disable_state_gating:
-                    cycle_step_embedding = cycle_step_embedding * self.decode_cycle_gate(
-                        torch.cat((light_state_embedding, cycle_step_embedding), dim=1)
-                    )
                 step_state_residual = self.build_decoder_state_residual(
                     light_state_embedding,
                     queue_context_for_decode,
-                    cycle_step_embedding,
+                    cycle_context_for_decode,
                 )
                 if step_state_residual is not None:
                     pred_lstm_hidden = pred_lstm_hidden + step_state_residual
@@ -2182,6 +2328,26 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                     obs_state,
                     pred_state,
                 )
+                if not self.disable_aux_losses:
+                    rollout_cycle_info = self.rollout_cycle_step(
+                        current_cycle_feature,
+                        rollout_cycle_h_t,
+                        rollout_cycle_c_t,
+                    )
+                    rollout_cycle_h_t = rollout_cycle_info["cycle_hidden"]
+                    rollout_cycle_c_t = rollout_cycle_info["cycle_cell"]
+                    cycle_context_for_decode = rollout_cycle_h_t
+                    if not self.disable_state_gating:
+                        cycle_context_for_decode = cycle_context_for_decode * self.decode_cycle_gate(
+                            torch.cat(
+                                (light_state_embedding, cycle_context_for_decode),
+                                dim=1,
+                            )
+                        )
+                    cycle_rollout_hidden_seq.append(rollout_cycle_h_t)
+                    cycle_decode_context_seq.append(cycle_context_for_decode)
+                else:
+                    cycle_context_for_decode = cycle_step_embedding
                 if not self.disable_queue_rollout:
                     rollout_info = self.rollout_queue_step(
                         rollout_queue_feature,
@@ -2216,14 +2382,10 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                     queue_decode_context_seq.append(queue_context_for_decode)
                 else:
                     queue_context_for_decode = gated_queue_last
-                if not self.disable_state_gating:
-                    cycle_step_embedding = cycle_step_embedding * self.decode_cycle_gate(
-                        torch.cat((light_state_embedding, cycle_step_embedding), dim=1)
-                    )
                 step_state_residual = self.build_decoder_state_residual(
                     light_state_embedding,
                     queue_context_for_decode,
-                    cycle_step_embedding,
+                    cycle_context_for_decode,
                 )
                 if step_state_residual is not None:
                     pred_lstm_hidden = pred_lstm_hidden + step_state_residual
@@ -2249,6 +2411,14 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         if queue_decode_context_seq:
             self.debug_last_aux["queue_decode_context_seq"] = torch.stack(
                 queue_decode_context_seq
+            )
+        if cycle_rollout_hidden_seq:
+            self.debug_last_aux["cycle_rollout_hidden_seq"] = torch.stack(
+                cycle_rollout_hidden_seq
+            )
+        if cycle_decode_context_seq:
+            self.debug_last_aux["cycle_decode_context_seq"] = torch.stack(
+                cycle_decode_context_seq
             )
         if lane_queue_rollout_anchor_seq:
             self.debug_last_aux["lane_queue_rollout_anchor_seq"] = torch.stack(

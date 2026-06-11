@@ -23,6 +23,7 @@ from models import (
     TrajectoryGenerator,
     TrajectoryDiscriminator,
     CycleStateTrajectoryGenerator,
+    AblationConfig,
     RolloutQueueCoefs,
     apply_rollout_coefs_override,
 )
@@ -220,6 +221,12 @@ parser.add_argument(
     default=None,
     type=float,
     help="CycleState rollout queue delta 注入 decoder 的缩放系数。",
+)
+parser.add_argument(
+    "--decoder_state_residual_scale",
+    default=None,
+    type=float,
+    help="CycleState decoder state residual 注入 decoder hidden 的缩放系数。",
 )
 # Phase 3 #16: 把 ``rollout_queue_features`` 内 hardcoded 的物理系数集中到
 # ``RolloutQueueCoefs`` dataclass 后,允许通过 JSON 字符串做部分字段覆盖。
@@ -522,6 +529,7 @@ TRAIN_STAGE_DEFAULTS = {
         "teacher_forcing_ratio": 0.8,
         "grad_clip": 1.0,
         "rollout_residual_scale": 0.35,
+        "decoder_state_residual_scale": 1.0,
         "detach_rollout_state": True,
     },
     "refine": {
@@ -532,6 +540,7 @@ TRAIN_STAGE_DEFAULTS = {
         "teacher_forcing_ratio": 0.6,
         "grad_clip": 1.0,
         "rollout_residual_scale": 0.7,
+        "decoder_state_residual_scale": 1.0,
         "detach_rollout_state": False,
     },
     "adversarial": {
@@ -542,6 +551,7 @@ TRAIN_STAGE_DEFAULTS = {
         "teacher_forcing_ratio": 0.4,
         "grad_clip": 1.0,
         "rollout_residual_scale": 0.7,
+        "decoder_state_residual_scale": 1.0,
         "detach_rollout_state": False,
     },
 }
@@ -554,6 +564,7 @@ BASELINE_DEFAULTS = {
     "teacher_forcing_ratio": 0.5,
     "grad_clip": 0.0,
     "rollout_residual_scale": 1.0,
+    "decoder_state_residual_scale": 1.0,
     "detach_rollout_state": False,
 }
 
@@ -885,7 +896,7 @@ def compute_structured_aux_losses(
       跨步稳定性, 仅取末帧监督 rollout 等于砍掉 11/12 的信号。
 
     任何把 main aux 改成"全序列监督"或把 rollout aux 改成"末帧监督"
-    的重构都必须显式记录在 PLAN.md §2.4, 否则 :func:`tests.test_cyclestate_protocol`
+    的重构都必须显式记录在 ``docs/PLAN.md`` 的活跃 backlog 中, 否则 :func:`tests.test_cyclestate_protocol`
     中 ``test_train_call_site_uses_last_frame_for_main_and_sequence_for_rollout``
     会失败。
 
@@ -1330,9 +1341,47 @@ def compute_best_of_k_metric_sums(
 def maybe_load_compatible_weights(model, state_dict):
     """尽量复用旧 checkpoint 中与当前模型形状兼容的参数。"""
     model_state = model.state_dict()
+    legacy_state = dict(state_dict)
+
+    # Phase 6 #45: 兼容旧版单头 aux checkpoint。
+    # 旧 CycleState 使用:
+    #   queue_aux_head: 6 = [4 reg, 2 cls]
+    #   cycle_aux_head: 6 = [3 phase, 2 time, 1 change]
+    # 新版拆成独立子头后,加载侧需要显式做一次按槽位切分,否则
+    # evaluate/train 都会因为 missing/unexpected keys 直接失败。
+    queue_weight = legacy_state.pop("queue_aux_head.weight", None)
+    queue_bias = legacy_state.pop("queue_aux_head.bias", None)
+    if queue_weight is not None and queue_bias is not None:
+        legacy_state.setdefault("queue_aux_reg_head.weight", queue_weight[:4].clone())
+        legacy_state.setdefault("queue_aux_reg_head.bias", queue_bias[:4].clone())
+        legacy_state.setdefault("queue_aux_cls_head.weight", queue_weight[4:].clone())
+        legacy_state.setdefault("queue_aux_cls_head.bias", queue_bias[4:].clone())
+
+    cycle_weight = legacy_state.pop("cycle_aux_head.weight", None)
+    cycle_bias = legacy_state.pop("cycle_aux_head.bias", None)
+    if cycle_weight is not None and cycle_bias is not None:
+        legacy_state.setdefault(
+            "cycle_aux_phase_head.weight", cycle_weight[:3].clone()
+        )
+        legacy_state.setdefault(
+            "cycle_aux_phase_head.bias", cycle_bias[:3].clone()
+        )
+        legacy_state.setdefault(
+            "cycle_aux_time_head.weight", cycle_weight[3:5].clone()
+        )
+        legacy_state.setdefault(
+            "cycle_aux_time_head.bias", cycle_bias[3:5].clone()
+        )
+        legacy_state.setdefault(
+            "cycle_aux_change_head.weight", cycle_weight[5:6].clone()
+        )
+        legacy_state.setdefault(
+            "cycle_aux_change_head.bias", cycle_bias[5:6].clone()
+        )
+
     compatible_state = {}
     skipped = []
-    for key, value in state_dict.items():
+    for key, value in legacy_state.items():
         if key in model_state and model_state[key].shape == value.shape:
             compatible_state[key] = value
         else:
@@ -1423,14 +1472,12 @@ def main(args):
         noise_type=args.noise_type,
     )
     if args.model_type == "cyclestate":
-        model_kwargs["disable_state_gating"] = args.disable_state_gating
-        model_kwargs["disable_queue_rollout"] = args.disable_queue_rollout
-        model_kwargs["disable_lane_queue_anchor"] = args.disable_lane_queue_anchor
-        model_kwargs["disable_decoder_state_residual"] = (
-            args.disable_decoder_state_residual
-        )
-        model_kwargs["disable_aux_losses"] = args.disable_aux_losses
+        ablation_cfg = AblationConfig.from_args(args)
+        model_kwargs.update(ablation_cfg.to_model_kwargs())
         model_kwargs["rollout_residual_scale"] = args.rollout_residual_scale
+        model_kwargs["decoder_state_residual_scale"] = (
+            args.decoder_state_residual_scale
+        )
         model_kwargs["detach_rollout_state"] = args.detach_rollout_state
         # Phase 3 #23: 把 ``--phase_duration_limits`` 透传到模型构造函数;
         # ``None`` 触发 ``__init__`` 默认值 ``(38.0, 47.0, 2.0)``, 与原硬编码
@@ -1467,13 +1514,15 @@ def main(args):
     # Phase 4 #22: 日志口径必须反映 ``disable_aux_losses=True`` 强制开启四个子开关
     # 之后的"模型实际生效状态", 而不是原始 ``args.disable_*``。这样才能保证消融实验
     # 日志与运行时的真实行为一致, 满足可审计性。
-    _disable_aux = bool(getattr(args, "disable_aux_losses", False))
-    _eff_disable_state_gating = _disable_aux or bool(args.disable_state_gating)
-    _eff_disable_queue_rollout = _disable_aux or bool(args.disable_queue_rollout)
-    _eff_disable_lane_queue_anchor = _disable_aux or bool(args.disable_lane_queue_anchor)
-    _eff_disable_decoder_state_residual = _disable_aux or bool(
-        args.disable_decoder_state_residual
-    )
+    ablation_cfg = AblationConfig.from_args(args)
+    _disable_aux = ablation_cfg.disable_aux_losses
+    _effective_ablation = ablation_cfg.effective_flags()
+    _eff_disable_state_gating = _effective_ablation["disable_state_gating"]
+    _eff_disable_queue_rollout = _effective_ablation["disable_queue_rollout"]
+    _eff_disable_lane_queue_anchor = _effective_ablation["disable_lane_queue_anchor"]
+    _eff_disable_decoder_state_residual = _effective_ablation[
+        "disable_decoder_state_residual"
+    ]
     logging.info(
         "Training protocol | model_type=%s stage=%s val_split=%s lr=%.6f grad_clip=%.3f generator_only=%s gan_weight=%.3f aux_queue=%.3f aux_rollout=%.3f aux_cycle=%.3f rollout_residual_scale=%.3f detach_rollout_state=%s phase_duration_limits=%s disable_state_gating(eff)=%s disable_queue_rollout(eff)=%s disable_lane_queue_anchor(eff)=%s disable_decoder_state_residual(eff)=%s disable_aux_losses=%s teacher_forcing=%.3f",
         args.model_type,

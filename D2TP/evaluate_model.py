@@ -9,6 +9,7 @@ from data.loader import data_loader
 from models import (
     TrajectoryGenerator,
     CycleStateTrajectoryGenerator,
+    AblationConfig,
     RolloutQueueCoefs,
     apply_rollout_coefs_override,
 )
@@ -16,6 +17,7 @@ from train import (
     build_traffic_context_from_batch,
     compute_best_of_k_metric_sums,
     compute_raw_displacement_metrics,
+    maybe_load_compatible_weights,
     parse_rollout_queue_coefs,
     NumValSamplesTracker,
     reapply_phase_duration_limits_if_overridden,
@@ -102,6 +104,12 @@ parser.add_argument(
     default=1.0,
     type=float,
     help="CycleState rollout queue delta 注入 decoder 的缩放系数，需与训练 checkpoint 协议一致。",
+)
+parser.add_argument(
+    "--decoder_state_residual_scale",
+    default=1.0,
+    type=float,
+    help="CycleState decoder state residual 注入 decoder hidden 的缩放系数。",
 )
 # Phase 3 #16: 评估侧同样支持 ``--rollout_queue_coefs_json`` JSON 字符串覆盖,
 # 行为与 train.py 一致; 留空使用 ``RolloutQueueCoefs()`` 默认值, 与原硬编码兼容。
@@ -230,14 +238,15 @@ def get_generator(checkpoint):
         noise_type=args.noise_type,
     )
     if args.model_type == "cyclestate":
-        model_kwargs["disable_state_gating"] = args.disable_state_gating
-        model_kwargs["disable_queue_rollout"] = args.disable_queue_rollout
-        model_kwargs["disable_lane_queue_anchor"] = args.disable_lane_queue_anchor
-        model_kwargs["disable_decoder_state_residual"] = (
-            args.disable_decoder_state_residual
-        )
-        model_kwargs["disable_aux_losses"] = args.disable_aux_losses
+        # Phase 4 #22/#31: ``to_model_kwargs()`` 会把 "disable_aux_losses"
+        # 及四个子开关一起从 ``args.disable_aux_losses`` / ``args.disable_*``
+        # 集中映射到模型构造参数，避免 train/eval 两侧再手写一份散落透传逻辑。
+        ablation_cfg = AblationConfig.from_args(args)
+        model_kwargs.update(ablation_cfg.to_model_kwargs())
         model_kwargs["rollout_residual_scale"] = args.rollout_residual_scale
+        model_kwargs["decoder_state_residual_scale"] = (
+            getattr(args, "decoder_state_residual_scale", 1.0)
+        )
         model_kwargs["detach_rollout_state"] = args.detach_rollout_state
         # Phase 3 #23: 把 ``--phase_duration_limits`` 透传到模型构造函数;
         # ``None`` 触发 ``__init__`` 默认值, 与训练时的协议保持一致。
@@ -252,7 +261,10 @@ def get_generator(checkpoint):
             getattr(args, "rollout_queue_coefs_json", "")
         )
     model = model_cls(**model_kwargs)
-    model.load_state_dict(checkpoint["state_dict"])
+    if args.model_type == "cyclestate":
+        maybe_load_compatible_weights(model, checkpoint["state_dict"])
+    else:
+        model.load_state_dict(checkpoint["state_dict"])
     reapply_phase_duration_limits_if_overridden(
         model,
         getattr(args, "phase_duration_limits", None),
