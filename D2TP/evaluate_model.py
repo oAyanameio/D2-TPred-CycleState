@@ -100,6 +100,40 @@ parser.add_argument(
     "使模型行为等价于全消融模式，用于公平评估消融基线。",
 )
 parser.add_argument(
+    "--minimal_viable_mode",
+    action="store_true",
+    help="DE-3 决定性实验评估开关：与 train.py 配套使用，强制开启 5 个 disable "
+    "开关并把 ``[queue_last, cycle_last]`` 直接拼接到 decoder 初始化向量后面。"
+    "评估侧必须与训练时一致, 否则 decoder hidden 维度对不上会报 shape mismatch。",
+)
+parser.add_argument(
+    "--oracle_inject_mode",
+    action="store_true",
+    help="DE-1 决定性实验评估开关：与 train.py 配套使用，强制开启 5 个 disable "
+    "开关并把单步 oracle 特征 (10 dim) 直接拼接到 ``pred_lstm_model`` 的输入后面。"
+    "评估侧必须与训练时一致, 否则 pred_lstm_model 输入维度对不上会报 shape mismatch。",
+)
+parser.add_argument(
+    "--ar1_direct_inject_mode",
+    action="store_true",
+    help="AR-1 决定性实验评估开关：与 train.py 配套使用，强制开启 5 个 disable "
+    "开关并把观测期最后时刻的 ``[queue_last, cycle_last]`` (48 dim) 同时拼接到: "
+    "1) decoder 初始化向量 (与 DE-3 一致), 2) ``pred_lstm_model`` 每步输入, "
+    "3) ``pred_hidden2pos`` 输出投影。评估侧必须与训练时一致, 否则 "
+    "pred_lstm_model / pred_hidden2pos 的输入维度对不上会报 shape mismatch。",
+)
+parser.add_argument(
+    "--ar2_multiplicative_gating_mode",
+    action="store_true",
+    help="AR-2 决定性实验评估开关：与 train.py 配套使用, 强制开启 5 个 disable "
+    "开关, 沿用 DE-3 的 init 拼接, 并叠加一个 per-step sigmoid 乘法门控: "
+    "在 ``pred_lstm_model`` 更新 ``pred_lstm_hidden`` 后, 用 "
+    "``[pred_lstm_hidden, queue_last, cycle_last]`` 通过 2 层 MLP + sigmoid "
+    "得到一个 (0, 1) 之间的逐元素门控, 然后 ``pred_lstm_hidden = pred_lstm_hidden * gate``。"
+    "评估侧必须与训练时一致, 否则 ``ar2_hidden_gate`` 模块不会被创建, "
+    "加载 checkpoint 时会报 missing key 错误。",
+)
+parser.add_argument(
     "--rollout_residual_scale",
     default=1.0,
     type=float,
@@ -259,6 +293,30 @@ def get_generator(checkpoint):
         # rollout 行为会偏离 checkpoint 学习到的分布。
         model_kwargs["rollout_queue_coefs"] = parse_rollout_queue_coefs(
             getattr(args, "rollout_queue_coefs_json", "")
+        )
+        # DE-3: 把 ``--minimal_viable_mode`` 透传到模型构造函数; 必须与
+        # 训练时一致, 否则 pred_lstm_hidden_size 与 checkpoint 不匹配会
+        # 报 shape error。
+        model_kwargs["minimal_viable_mode"] = bool(
+            getattr(args, "minimal_viable_mode", False)
+        )
+        # DE-1: 把 ``--oracle_inject_mode`` 透传到模型构造函数; 必须与
+        # 训练时一致, 否则 pred_lstm_model 的输入维度与 checkpoint 不匹配
+        # 会报 shape error。
+        model_kwargs["oracle_inject_mode"] = bool(
+            getattr(args, "oracle_inject_mode", False)
+        )
+        # AR-1: 把 ``--ar1_direct_inject_mode`` 透传到模型构造函数; 必须与
+        # 训练时一致, 否则 pred_lstm_model / pred_hidden2pos 的输入维度
+        # 与 checkpoint 不匹配会报 shape error。
+        model_kwargs["ar1_direct_inject_mode"] = bool(
+            getattr(args, "ar1_direct_inject_mode", False)
+        )
+        # AR-2: 把 ``--ar2_multiplicative_gating_mode`` 透传到模型构造函数;
+        # 必须与训练时一致, 否则 ``ar2_hidden_gate`` 模块不会被创建,
+        # 加载 checkpoint 时会报 missing key 错误。
+        model_kwargs["ar2_multiplicative_gating_mode"] = bool(
+            getattr(args, "ar2_multiplicative_gating_mode", False)
         )
     model = model_cls(**model_kwargs)
     if args.model_type == "cyclestate":

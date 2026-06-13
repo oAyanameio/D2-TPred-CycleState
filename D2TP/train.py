@@ -211,6 +211,55 @@ parser.add_argument(
     "使 CycleState 行为等价于全消融模式（功能上对齐 baseline）。",
 )
 parser.add_argument(
+    "--minimal_viable_mode",
+    action="store_true",
+    help="DE-3 决定性实验开关：把 CycleState 降到'最简可行'形态 — "
+    "强制关闭 state_gating / queue_rollout / lane_queue_anchor / "
+    "decoder_state_residual / aux_losses, 并把观测期最后时刻的 "
+    "``[queue_last, cycle_last]`` 直接拼接到 decoder 初始化向量 "
+    "``encoded_before_noise_hidden`` 后面, 验证'直接拼接'是否比'加性残差'"
+    "更有效。该开关只能在 ``--model_type cyclestate`` 时生效。",
+)
+parser.add_argument(
+    "--oracle_inject_mode",
+    action="store_true",
+    help="DE-1 决定性实验开关：把 CycleState 改为'oracle 交通状态直注'形态 — "
+    "强制关闭 state_gating / queue_rollout / lane_queue_anchor / "
+    "decoder_state_residual / aux_losses, 并把单步 oracle 特征 "
+    "(phase one-hot / elapsed / remaining / distance / direction / speed / "
+    "phase_change, 10 维) 直接拼接到 ``pred_lstm_model`` 的输入后面。oracle "
+    "特征**不**经过任何学习,直接由 ``pred_state`` 与当前解码位置算出,等价于 "
+    "bypass 整个 queue/cycle LSTM 分支。该开关只能在 ``--model_type cyclestate`` "
+    "时生效。",
+)
+parser.add_argument(
+    "--ar1_direct_inject_mode",
+    action="store_true",
+    help="AR-1 决定性实验开关：把 CycleState 改为'直接条件注入'形态 — "
+    "在 DE-3 (init 拼接) 之上叠加两个新机制: 1. 把观测期最后时刻的 "
+    "``[queue_last, cycle_last]`` (32+16=48 维, 不参与学习) 作为 "
+    "``pred_lstm_model`` 的每步拼接输入; 2. 把同样的 state context 同时拼到 "
+    "``pred_hidden2pos`` 输出投影的输入。隐含启用 ``--minimal_viable_mode``, "
+    "即 AR-1 = DE-3 + per-step inject + output-projection inject。AR-1 与 "
+    "``--oracle_inject_mode`` 互斥: AR-1 用 learned hidden, DE-1 用 oracle "
+    "物理特征。该开关只能在 ``--model_type cyclestate`` 时生效。",
+)
+parser.add_argument(
+    "--ar2_multiplicative_gating_mode",
+    action="store_true",
+    help="AR-2 决定性实验开关：把 CycleState 改为'乘法门控'形态 — "
+    "在 DE-3 (init 拼接) 之上叠加一个新机制: 在 ``pred_lstm_model`` 每步 "
+    "更新 ``pred_lstm_hidden`` 后, 用一个 2 层 MLP + sigmoid 计算逐元素 "
+    "门控 (输入 = ``[pred_lstm_hidden, queue_last, cycle_last]``, 输出维度 "
+    "= ``pred_lstm_hidden_size``), 然后 ``pred_lstm_hidden = pred_lstm_hidden * gate``。"
+    "这是与 AR-1 (加性拼接) 不同的耦合方式: AR-2 用 state context 调制 "
+    "隐状态维度, AR-1 用 state context 扩展输入/输出。隐含启用 "
+    "``--minimal_viable_mode`` + 5 个 disable 开关, 即 AR-2 = DE-3 + "
+    "per-step multiplicative gate。AR-2 与 ``--oracle_inject_mode`` / "
+    "``--ar1_direct_inject_mode`` 互斥。该开关只能在 ``--model_type cyclestate`` "
+    "时生效。",
+)
+parser.add_argument(
     "--grad_clip",
     default=None,
     type=float,
@@ -1428,6 +1477,81 @@ def main(args):
             "（state_gating / queue_rollout / lane_queue_anchor / decoder_state_residual"
             " 全为 True，aux 权重均为 0），模型在功能上等价于全消融基线。"
         )
+    # DE-3: ``minimal_viable_mode`` 隐式把 aux 权重置零，因为最简版本来就不
+    # 消费任何 aux loss；保留 weight > 0 会让 ``compute_structured_aux_losses``
+    # 内部尝试去拿 ``debug_last_aux`` 里与 DE-3 路径不一致的字段，可能引入
+    # silent 噪声梯度。
+    if (
+        getattr(args, "minimal_viable_mode", False)
+        and args.model_type == "cyclestate"
+    ):
+        args.aux_queue_weight = 0.0
+        args.aux_cycle_weight = 0.0
+        args.aux_rollout_weight = 0.0
+        logging.info(
+            "[DE-3] minimal_viable_mode=ON: 模型在内部强制开启 5 个 disable 开关，"
+            "并把 aux 权重全部置零；'观测期最后时刻的 queue/cycle hidden' "
+            "会直接拼接到 decoder 初始化向量后面。"
+        )
+    # DE-1: ``oracle_inject_mode`` 隐式把 aux 权重置零，原因与
+    # ``minimal_viable_mode`` 相同：oracle 直注下模型不消费任何 aux 头
+    # 也不消费 queue/cycle LSTM hidden，保留 weight > 0 只会引入 silent
+    # 噪声梯度。
+    if (
+        getattr(args, "oracle_inject_mode", False)
+        and args.model_type == "cyclestate"
+    ):
+        args.aux_queue_weight = 0.0
+        args.aux_cycle_weight = 0.0
+        args.aux_rollout_weight = 0.0
+        logging.info(
+            "[DE-1] oracle_inject_mode=ON: 模型在内部强制开启 5 个 disable 开关，"
+            "并把 aux 权重全部置零；'单步 oracle 特征 (10 dim)' 会直接拼接到 "
+            "``pred_lstm_model`` 的输入后面,等价于 'oracle 交通状态 → decoder 内部信号'。"
+        )
+    # AR-1: ``ar1_direct_inject_mode`` 隐式把 aux 权重置零，原因与
+    # ``minimal_viable_mode`` / ``oracle_inject_mode`` 相同：AR-1 隐含
+    # ``minimal_viable_mode=True`` 且不消费任何 aux 头 / rollout hidden
+    # 也不消费 state_gating。
+    if (
+        getattr(args, "ar1_direct_inject_mode", False)
+        and args.model_type == "cyclestate"
+    ):
+        args.aux_queue_weight = 0.0
+        args.aux_cycle_weight = 0.0
+        args.aux_rollout_weight = 0.0
+        # AR-1 隐含 minimal_viable_mode=True,这里也把它置 True 以便日志
+        # 与 protocol-check 完整对齐; 模型内部会再次确认并强制开启 5 个
+        # disable 开关。
+        args.minimal_viable_mode = True
+        logging.info(
+            "[AR-1] ar1_direct_inject_mode=ON: 模型在内部强制开启 5 个 disable 开关，"
+            "并把 aux 权重全部置零；'观测期最后时刻的 [queue_last, cycle_last] (48 维)' "
+            "会同时拼接到: 1) decoder 初始化向量 (与 DE-3 一致), 2) ``pred_lstm_model`` "
+            "每步输入, 3) ``pred_hidden2pos`` 输出投影。"
+        )
+    # AR-2: ``ar2_multiplicative_gating_mode`` 隐式把 aux 权重置零, 原因与
+    # AR-1 相同: AR-2 隐含 ``minimal_viable_mode=True`` 且不消费任何 aux 头
+    # / rollout hidden / state_gating。AR-2 与 AR-1 / oracle_inject_mode
+    # 互斥, 模型内部会校验。
+    if (
+        getattr(args, "ar2_multiplicative_gating_mode", False)
+        and args.model_type == "cyclestate"
+    ):
+        args.aux_queue_weight = 0.0
+        args.aux_cycle_weight = 0.0
+        args.aux_rollout_weight = 0.0
+        # AR-2 隐含 minimal_viable_mode=True,这里也把它置 True 以便日志
+        # 与 protocol-check 完整对齐; 模型内部会再次确认并强制开启 5 个
+        # disable 开关。
+        args.minimal_viable_mode = True
+        logging.info(
+            "[AR-2] ar2_multiplicative_gating_mode=ON: 模型在内部强制开启 5 个 disable 开关，"
+            "并把 aux 权重全部置零；'观测期最后时刻的 [queue_last, cycle_last] (48 维)' "
+            "会用于: 1) decoder 初始化向量 (与 DE-3 一致), 2) ``ar2_hidden_gate`` "
+            "学习 per-step 逐元素 sigmoid 门控, 然后 ``pred_lstm_hidden = "
+            "pred_lstm_hidden * gate`` (乘法调制, 与 AR-1 的加性拼接不同)。"
+        )
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -1492,6 +1616,35 @@ def main(args):
         # 都回退到 ``RolloutQueueCoefs()`` 默认值, 与原硬编码行为一致。
         model_kwargs["rollout_queue_coefs"] = parse_rollout_queue_coefs(
             getattr(args, "rollout_queue_coefs_json", "")
+        )
+        # DE-3: 把 ``--minimal_viable_mode`` 透传到模型构造函数。
+        # 注意: 这个开关与 ``disable_aux_losses`` 互不冲突; 模型内部会先把
+        # ``minimal_viable_mode=True`` 解释为强制开启 5 个 disable 开关,
+        # 然后再独立修改 ``encoded_before_noise_hidden`` 的拼接方式。
+        model_kwargs["minimal_viable_mode"] = bool(
+            getattr(args, "minimal_viable_mode", False)
+        )
+        # DE-1: 把 ``--oracle_inject_mode`` 透传到模型构造函数; 必须在
+        # 训练和推理两侧都传,否则 ``pred_lstm_model`` 的输入维度与
+        # checkpoint 不匹配会报 shape error。
+        model_kwargs["oracle_inject_mode"] = bool(
+            getattr(args, "oracle_inject_mode", False)
+        )
+        # AR-1: 把 ``--ar1_direct_inject_mode`` 透传到模型构造函数;
+        # 必须在训练和推理两侧都传,否则 ``pred_lstm_model`` /
+        # ``pred_hidden2pos`` 的输入维度与 checkpoint 不匹配会报
+        # shape error。AR-1 与 ``oracle_inject_mode`` 互斥,模型内部
+        # 会校验。
+        model_kwargs["ar1_direct_inject_mode"] = bool(
+            getattr(args, "ar1_direct_inject_mode", False)
+        )
+        # AR-2: 把 ``--ar2_multiplicative_gating_mode`` 透传到模型构造函数;
+        # 必须在训练和推理两侧都传,否则 ``ar2_hidden_gate`` 模块不会被
+        # 创建,加载 checkpoint 时会报 ``unexpected key`` / ``missing key``
+        # 错误。AR-2 与 ``oracle_inject_mode`` / ``ar1_direct_inject_mode``
+        # 互斥,模型内部会校验。
+        model_kwargs["ar2_multiplicative_gating_mode"] = bool(
+            getattr(args, "ar2_multiplicative_gating_mode", False)
         )
     model = model_cls(**model_kwargs)
     model.to(args.device)

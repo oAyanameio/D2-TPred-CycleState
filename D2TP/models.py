@@ -1093,7 +1093,149 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         decoder_state_residual_scale=1.0,
         detach_rollout_state=False,
         rollout_queue_coefs=None,
+        minimal_viable_mode=False,
+        oracle_inject_mode=False,
+        ar1_direct_inject_mode=False,
+        ar2_multiplicative_gating_mode=False,
     ):
+        # DE-1 决定性实验: ``oracle_inject_mode`` 把"oracle 交通状态直注"
+        # 行为封装到一个独立 protocol-check 开关下。当启用时:
+        # 1. 强制关闭 state_gating / queue_rollout / lane_queue_anchor /
+        #    decoder_state_residual / aux_losses 五个开关,等价于
+        #    ``disable_aux_losses=True`` 路径;
+        # 2. **不**再消费 queue_lstm_model / cycle_lstm_model 输出的 hidden,
+        #    也**不**消费任何 aux 头;
+        # 3. 替换 ``pred_lstm_model`` 为新版本:输入维度由
+        #    ``traj_lstm_input_size`` 扩大到
+        #    ``traj_lstm_input_size + oracle_feature_size``,oracle 特征
+        #    (phase one-hot / elapsed / remaining / distance / direction / speed
+        #    / phase_change) 直接拼接到每一步的 LSTM 输入后面,等价于
+        #    "把真实交通状态(不做任何学习)塞进 decoder 内部信号";
+        # 4. ``encoded_before_noise_hidden`` 不再拼 queue/cycle hidden。
+        # 目的是验证"如果 oracle state 真的能进 decoder 内部,指标能到
+        # 多少" — 这是 baseline (oracle-light only) 与 DE-3 (state-hidden
+        # learned) 之间的"上限参考线":oracle 直注不能超过 baseline 太多,
+        # 说明"交通状态 → 轨迹"的边际贡献本身有限,即使完全 oracle 也不行。
+        self.oracle_inject_mode = bool(oracle_inject_mode)
+        if self.oracle_inject_mode:
+            # DE-1: oracle 直注下,所有依赖"学习得到的状态表征"的机制都
+            # 失去意义(state hidden / state gating / rollout / anchor /
+            # state residual / aux loss) — oracle 特征已经包含了所有
+            # 真实交通状态,不需要再让模型去"学"什么。强制把 5 个 disable
+            # 开关置 True,等价于走 ``disable_aux_losses=True`` 的路径。
+            disable_state_gating = True
+            disable_queue_rollout = True
+            disable_lane_queue_anchor = True
+            disable_decoder_state_residual = True
+            disable_aux_losses = True
+        # AR-1 决定性实验: ``ar1_direct_inject_mode`` 在 DE-3 之上叠加两个新机制:
+        # 1. ``pred_lstm_model`` 的每步输入拼接 ``[queue_last, cycle_last]``
+        #    (48 维, 不参与学习) — 把 state context 拉成 decoder 的
+        #    "per-step conditional input",而不是只在初始化时拼一次;
+        # 2. ``pred_hidden2pos`` 的输入也拼接同样的 state context — 把
+        #    state context 强行拉进输出投影层,直接参与最终 (dx, dy) 的预测。
+        # 这与 DE-1 的核心差异在于:DE-1 用"oracle 物理特征 10 维"拼 LSTM
+        # input,AR-1 用"学到的 32D+16D hidden"同时拼 LSTM input + 输出
+        # 投影。AR-1 隐含启用 ``minimal_viable_mode=True``(init 拼接), 即
+        # AR-1 = DE-3 + 每步拼接 + 输出投影。
+        # AR-1 设计的核心动机是 DE-1 的反直觉发现:oracle 特征拼到 LSTM
+        # input **没有**拼到 init 有效,说明 decoder 对"注入位置"敏感。
+        # AR-1 在 DE-3 拼接位置 (init) 基础上扩展注入强度 — 既保留 init
+        # 拼接, 又叠加 per-step + output-projection 拼接 — 看是否能
+        # 进一步逼近 baseline。
+        # AR-1 与 ``oracle_inject_mode`` 互斥:AR-1 用 learned hidden
+        # (32+16=48 维) 而 DE-1 用 oracle 物理特征 (10 维), 两者拼接
+        # 语义不同,不能同时启用。
+        # 注意: AR-1 的强制开启 ``minimal_viable_mode=True`` 与
+        # ``disable_*`` 开关的逻辑必须放在 ``self.minimal_viable_mode``
+        # 与 ``disable_*`` 赋值之后,否则会访问到未赋值的属性。下方会
+        # 在 ``self.minimal_viable_mode = bool(minimal_viable_mode)``
+        # 之后再做 AR-1 互斥校验与强制开启。
+        self.ar1_direct_inject_mode = bool(ar1_direct_inject_mode)
+        # AR-2 决定性实验: ``ar2_multiplicative_gating_mode`` 在 DE-3 之上叠加
+        # 乘法门控机制 — 区别于 AR-1 的"加性拼接",AR-2 用"乘法调制":
+        # 1. ``pred_lstm_model`` 每一步更新 ``pred_lstm_hidden`` 后,根据
+        #    ``[pred_lstm_hidden, state_context]`` 学习一个 sigmoid 门控
+        #    (维度 = pred_lstm_hidden_size),然后做逐元素乘法
+        #    ``pred_lstm_hidden = pred_lstm_hidden * gate``。这等价于
+        #    "state context 通过乘法决定哪些隐状态维度被放大/抑制"。
+        # 2. 与 AR-1 的核心差异:AR-1 在 init / per-step input / output
+        #    projection 三个位置"加性"地注入 state context;AR-2 仅在
+        #    init 拼接(沿用 DE-3)与 per-step 乘法门控"调制"两个位置
+        #    注入 — 同样的 state context,通过 sigmoid 门控乘以
+        #    pred_lstm_hidden,产生非线性"调制"效果。
+        # 3. AR-2 隐含启用 ``minimal_viable_mode=True``(init 拼接),即
+        #    AR-2 = DE-3 + per-step multiplicative gate。
+        # 4. AR-2 与 ``oracle_inject_mode`` / ``ar1_direct_inject_mode``
+        #    互斥:AR-2 用 learned 32+16 hidden 拼 init + 乘法调制;
+        #    DE-1 用 oracle 10 维物理特征拼 LSTM input;
+        #    AR-1 用 learned 32+16 hidden 拼 init/per-step input/output。
+        #    三者耦合方式不同不能同时启用。
+        # 5. 注意: AR-2 的强制开启 ``minimal_viable_mode=True`` 与
+        #    ``disable_*`` 开关的逻辑必须放在 ``self.minimal_viable_mode``
+        #    赋值之后再做互斥校验, 与 AR-1 同。
+        self.ar2_multiplicative_gating_mode = bool(ar2_multiplicative_gating_mode)
+        # DE-3 决定性实验: ``minimal_viable_mode`` 把"最简可行 CycleState"
+        # 行为封装到一个独立的 protocol-check 开关下。当启用时:
+        # 1. 强制关闭 state_gating / queue_rollout / lane_queue_anchor /
+        #    decoder_state_residual 四个开关,去掉所有复杂机制;
+        # 2. 把观测期最后时刻的 ``queue_hidden`` 与 ``cycle_hidden`` 直接
+        #    拼接到 decoder 初始化向量 ``encoded_before_noise_hidden`` 后面,
+        #    与 ``light_state_embedding`` 同级(而不是加性残差);
+        # 3. 不再消费 aux loss,state 分支的 hidden 必须靠 trajectory loss
+        #    自发学到对预测有用的表征。
+        # 目的是验证"直接把 state hidden 拼进 decoder 初始化"这条更简单的
+        # 路径是否成立,以及判断后续 AR-1/AR-2 强耦合方案是否值得做。
+        self.minimal_viable_mode = bool(minimal_viable_mode)
+        if self.minimal_viable_mode:
+            disable_state_gating = True
+            disable_queue_rollout = True
+            disable_lane_queue_anchor = True
+            disable_decoder_state_residual = True
+            disable_aux_losses = True
+        # AR-1 互斥校验与强制开启 — 必须放在 ``self.minimal_viable_mode``
+        # 赋值之后, 这样 ``not self.minimal_viable_mode`` 检查才不会
+        # 访问到未赋值的属性。AR-1 与 ``oracle_inject_mode`` 互斥,
+        # AR-1 隐含 ``minimal_viable_mode=True`` + 5 个 disable 开关
+        # 全部置 True。
+        if self.ar1_direct_inject_mode and self.oracle_inject_mode:
+            raise ValueError(
+                "AR-1 (--ar1_direct_inject_mode) 与 DE-1 (--oracle_inject_mode) "
+                "互斥: AR-1 用 learned 32+16 hidden 拼 LSTM input / 输出投影, "
+                "DE-1 用 oracle 10 维物理特征拼 LSTM input, 两者语义不同不能同时启用。"
+            )
+        if self.ar1_direct_inject_mode and not self.minimal_viable_mode:
+            self.minimal_viable_mode = True
+            disable_state_gating = True
+            disable_queue_rollout = True
+            disable_lane_queue_anchor = True
+            disable_decoder_state_residual = True
+            disable_aux_losses = True
+        # AR-2 互斥校验与强制开启 — 必须放在 ``self.minimal_viable_mode``
+        # 赋值之后, 这样 ``not self.minimal_viable_mode`` 检查才不会
+        # 访问到未赋值的属性。AR-2 与 ``oracle_inject_mode`` / ``ar1_direct_inject_mode``
+        # 互斥, AR-2 隐含 ``minimal_viable_mode=True`` + 5 个 disable 开关
+        # 全部置 True (与 AR-1 行为一致)。
+        if self.ar2_multiplicative_gating_mode and self.oracle_inject_mode:
+            raise ValueError(
+                "AR-2 (--ar2_multiplicative_gating_mode) 与 DE-1 (--oracle_inject_mode) "
+                "互斥: AR-2 用 learned 32+16 hidden 做乘法门控, "
+                "DE-1 用 oracle 10 维物理特征拼 LSTM input, 两者语义不同不能同时启用。"
+            )
+        if self.ar2_multiplicative_gating_mode and self.ar1_direct_inject_mode:
+            raise ValueError(
+                "AR-2 (--ar2_multiplicative_gating_mode) 与 AR-1 (--ar1_direct_inject_mode) "
+                "互斥: AR-2 用'乘法门控'调制 pred_lstm_hidden, "
+                "AR-1 用'加性拼接'拼 LSTM input / 输出投影, "
+                "两种耦合方式不能同时启用以避免混淆归因。"
+            )
+        if self.ar2_multiplicative_gating_mode and not self.minimal_viable_mode:
+            self.minimal_viable_mode = True
+            disable_state_gating = True
+            disable_queue_rollout = True
+            disable_lane_queue_anchor = True
+            disable_decoder_state_residual = True
+            disable_aux_losses = True
         # Phase 4 #22: ``disable_aux_losses`` 是消融实验的统一主开关。
         # 当启用时，所有 CycleState 特有功能（state gating、queue rollout、
         # lane queue anchor、decoder state residual）一次性关闭，四个独立
@@ -1103,6 +1245,16 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
             disable_queue_rollout = True
             disable_lane_queue_anchor = True
             disable_decoder_state_residual = True
+        # DE-3: 最简可行 CycleState — 把 ``[queue_last, cycle_last]`` 直接拼到
+        # ``encoded_before_noise_hidden`` 后面后, 整个 decoder 初始化向量的
+        # 维度变大, 因此 ``pred_lstm_hidden_size`` 需要相应扩大, 并重建
+        # ``pred_lstm_model`` (LSTMCell) 与 ``pred_hidden2pos`` (Linear) 两层
+        # 让它们的形状真正与新维度对齐。
+        # 注意: 这个分支必须放在 ``super().__init__()`` 之后, 因为
+        # ``light_embedding_size`` / ``traj_lstm_hidden_size`` /
+        # ``graph_lstm_hidden_size`` / ``noise_dim`` 来自父类,
+        # ``queue_lstm_hidden_size`` / ``cycle_lstm_hidden_size`` 在父类之后
+        # 才会被赋值。
         self.disable_aux_losses = disable_aux_losses
         super(CycleStateTrajectoryGenerator, self).__init__(
             obs_len=obs_len,
@@ -1121,6 +1273,114 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
             embedding_size=embedding_size,
             light_embedding_size=light_embedding_size,
         )
+        if self.minimal_viable_mode:
+            base_pred_hidden = (
+                self.light_embedding_size
+                + self.traj_lstm_hidden_size
+                + self.graph_lstm_hidden_size
+            )
+            # ``queue_lstm_hidden_size`` / ``cycle_lstm_hidden_size`` 这两个
+            # 属性是在 ``super().__init__()`` 之后才会被赋值, 这里直接用
+            # ``__init__`` 形参值, 不绕道 ``self.``。
+            self.pred_lstm_hidden_size = (
+                base_pred_hidden
+                + queue_lstm_hidden_size
+                + cycle_lstm_hidden_size
+                + self.noise_dim[0]
+            )
+            # AR-1: state context 维度 = queue_lstm_hidden_size +
+            # cycle_lstm_hidden_size — 也就是 DE-3 拼到 init 那一截
+            # ``[queue_last, cycle_last]``。AR-1 把它同时拼到
+            # ``pred_lstm_model`` 每步输入 + ``pred_hidden2pos`` 输出投影。
+            # AR-1 隐含 ``minimal_viable_mode=True``,所以这两个 ``*_dim``
+            # 已经在上面就位。
+            self.ar1_state_context_dim = (
+                queue_lstm_hidden_size + cycle_lstm_hidden_size
+            )
+            # AR-2: state context 维度与 AR-1 相同 = queue_lstm_hidden_size +
+            # cycle_lstm_hidden_size (32+16=48 维)。AR-2 不修改
+            # ``pred_lstm_model`` / ``pred_hidden2pos`` 的输入维度
+            # (与 AR-1 不同, AR-2 不"加性"地扩大输入),而是用同一个
+            # state context 通过 sigmoid 门控"乘法调制"
+            # ``pred_lstm_hidden``。所以 ``pred_lstm_model.input_size`` 与
+            # DE-3 保持一致 (traj_lstm_input_size=2),``pred_hidden2pos.in_features``
+            # 也与 DE-3 保持一致 (light_embedding_size + pred_lstm_hidden_size)。
+            self.ar2_state_context_dim = (
+                queue_lstm_hidden_size + cycle_lstm_hidden_size
+            )
+            # AR-1 模式下 pred_lstm_model 的每步输入 = [offset,
+            # state_context]; DE-3 (无 AR-1) 模式下 pred_lstm_model
+            # 的每步输入 = offset (2 维)。
+            pred_lstm_input_dim = traj_lstm_input_size
+            if self.ar1_direct_inject_mode:
+                pred_lstm_input_dim += self.ar1_state_context_dim
+            self.pred_lstm_model = nn.LSTMCell(
+                pred_lstm_input_dim, self.pred_lstm_hidden_size
+            )
+            # AR-1 模式下 pred_hidden2pos 的输入 = [light_embedding,
+            # pred_lstm_hidden, state_context]; DE-3 模式下 =
+            # [light_embedding, pred_lstm_hidden]。
+            pred_hidden2pos_in_dim = (
+                self.light_embedding_size + self.pred_lstm_hidden_size
+            )
+            if self.ar1_direct_inject_mode:
+                pred_hidden2pos_in_dim += self.ar1_state_context_dim
+            self.pred_hidden2pos = nn.Linear(pred_hidden2pos_in_dim, 2)
+        # AR-2: 乘法门控模块 — 与 ``pred_lstm_model`` / ``pred_hidden2pos``
+        # 并列定义。``ar2_hidden_gate`` 是一个 2 层 MLP, 输入维度 =
+        # pred_lstm_hidden_size + ar2_state_context_dim, 输出维度 =
+        # pred_lstm_hidden_size, 末尾用 sigmoid 把输出归一化到 (0, 1)
+        # 作为逐元素门控。运行时: gate = ar2_hidden_gate([pred_lstm_hidden,
+        # state_context]); pred_lstm_hidden = pred_lstm_hidden * gate。
+        # 注意: AR-2 隐含 ``minimal_viable_mode=True``, 所以
+        # ``self.pred_lstm_hidden_size`` 在上方 ``if self.minimal_viable_mode``
+        # 分支内已被正确扩展, ``ar2_hidden_gate`` 可以直接用。
+        if self.ar2_multiplicative_gating_mode and self.minimal_viable_mode:
+            self.ar2_hidden_gate = nn.Sequential(
+                nn.Linear(
+                    self.pred_lstm_hidden_size + self.ar2_state_context_dim,
+                    self.pred_lstm_hidden_size,
+                ),
+                nn.ReLU(),
+                nn.Linear(
+                    self.pred_lstm_hidden_size, self.pred_lstm_hidden_size
+                ),
+                nn.Sigmoid(),
+            )
+        # DE-1: oracle 特征向量长度,用于扩大 ``pred_lstm_model`` 的输入
+        # 维度。oracle 特征共 10 维:
+        #   [0:3]   phase one-hot (3 维,灯态 red/green/yellow)
+        #   [3:4]   elapsed (归一化到 cycle_time_norm)
+        #   [4:5]   remaining (归一化到 cycle_time_norm)
+        #   [5:6]   phase change flag (与上一帧相位比较)
+        #   [6:7]   distance to stop line (归一化到 queue_distance_norm)
+        #   [7:8]   direction x to stop line (归一化)
+        #   [8:9]   direction y to stop line (归一化)
+        #   [9:10]  speed from last predicted offset (归一化)
+        # 这些特征每一步都重新计算,既不依赖历史学习,也不需要模型去
+        # "猜" — 直接从 ``pred_state`` / ``obs_state`` 与当前解码位置
+        # 拿到。
+        # 注意: 这个赋值必须放在 ``super().__init__()`` 之后、
+        # ``if self.oracle_inject_mode:`` 检查之前,否则访问
+        # ``self.oracle_feature_dim`` 会抛 AttributeError。
+        self.oracle_feature_dim = 10
+        # DE-1: oracle 直注 — pred_lstm_model 的输入维度由
+        # ``traj_lstm_input_size`` (默认 2: dx/dy) 扩大到
+        # ``traj_lstm_input_size + oracle_feature_size``。
+        # oracle 特征在每一步的 decoder 输入中提供真实交通状态
+        # (phase / elapsed / remaining / distance / direction / speed
+        #  / phase_change),它们**不**经过任何学习,直接由
+        # ``pred_state`` / ``obs_state`` / 当前预测位置算出来。
+        # ``pred_lstm_hidden_size`` 与 baseline / DE-3 保持一致 — oracle
+        # 增大的是 *输入* 维度,不是 *hidden* 维度,这样 hidden 维度的
+        # 可比性不会被破坏。
+        # 注意: 这个分支必须放在 ``super().__init__()`` 之后,因为
+        # ``traj_lstm_input_size`` 来自父类。
+        if self.oracle_inject_mode:
+            self.pred_lstm_model = nn.LSTMCell(
+                traj_lstm_input_size + self.oracle_feature_dim,
+                self.pred_lstm_hidden_size,
+            )
         # queue_feature = [
         #   前方排队车辆数, 同车道密度, 同车道平均速度, 同车道等待比例,
         #   同车道释放比例, 当前灯态编号, 当前灯态持续时间, 自身到停止线距离,
@@ -1757,6 +2017,86 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         rolled[:, 10] = front_of_queue
         return rolled
 
+    def build_oracle_step_feature(
+        self,
+        step_index,
+        real_pos,
+        last_pred_offset,
+        obs_state,
+        pred_state,
+    ):
+        """DE-1 决定性实验: 单步 oracle 特征构造（无任何学习）。
+
+        构造 10 维 oracle 特征向量,直接由 ``obs_state`` / ``pred_state``
+        与当前解码位置 ``real_pos`` 算出来:
+
+        - ``[0:3]`` phase one-hot (red/green/yellow)
+        - ``[3:4]`` elapsed time, 归一化到 ``cycle_time_norm`` 并 clamp 到 [0, 2]
+        - ``[4:5]`` remaining time, 归一化到 ``cycle_time_norm`` 并 clamp 到 [0, 2]
+        - ``[5:6]`` phase change flag, 与上一帧相位比较;step 0 时退化为 0
+        - ``[6:7]`` distance to stop line, 归一化到 ``queue_distance_norm``
+        - ``[7:8]`` direction x to stop line, 归一化到 ``queue_distance_norm``
+        - ``[8:9]`` direction y to stop line, 归一化到 ``queue_distance_norm``
+        - ``[9:10]`` speed from last predicted offset, 归一化到 ``queue_speed_norm``
+
+        这些特征**不**经过任何学习,直接喂进 ``pred_lstm_model`` 的输入侧,
+        等价于"让 decoder LSTM 看到真实交通状态"。这是 baseline
+        (oracle-light only) 与 DE-3 (state-hidden learned) 之间的
+        "上限参考线":oracle 直注能到多少,代表了"交通状态信息本身"
+        对轨迹预测的最大可能贡献。
+
+        Args:
+            step_index: 当前预测步索引, 0 表示解码的第一步。
+            real_pos: `(batch, 2)` 当前解码位置 (绝对坐标), 由
+                ``relative_to_abs`` 累计解码位移得到。
+            last_pred_offset: `(batch, 2)` 上一步解码出的相对位移,
+                用于估算当前速度。
+            obs_state: `(obs_len, batch, 4)` 观测期灯态;step 0 使用其
+                最后一帧。
+            pred_state: `(pred_len, batch, 4)` 预测期灯态;step > 0
+                使用 ``pred_state[step_index - 1]``。
+
+        Returns:
+            oracle_feat: `(batch, oracle_feature_dim)` 单步 oracle 特征。
+        """
+        if step_index == 0:
+            state_frame = obs_state[-1]
+            # step 0 没有"上一帧"的概念,phase_change 退化为 0
+            prev_phase = state_frame[:, 2]
+        else:
+            state_frame = pred_state[step_index - 1]
+            prev_phase = pred_state[step_index - 2, :, 2]
+        # phase one-hot
+        phase = state_frame[:, 2].long().clamp(min=0, max=2)
+        phase_one_hot = F.one_hot(phase, num_classes=3).float()
+        # elapsed / remaining (normalized)
+        elapsed_raw = state_frame[:, 3:4]
+        elapsed = (elapsed_raw / self.cycle_time_norm).clamp(min=0.0, max=2.0)
+        phase_limits = self.phase_duration_limits[phase].unsqueeze(1)
+        remaining = ((phase_limits - elapsed_raw) / self.cycle_time_norm).clamp(
+            min=0.0, max=2.0
+        )
+        # phase change (与上一帧相位比较)
+        prev_clamped = prev_phase.long().clamp(min=0, max=2)
+        phase_change = (phase != prev_clamped).float().unsqueeze(1)
+        # distance / direction to stop line
+        stop_x = state_frame[:, 0:1]
+        stop_y = state_frame[:, 1:2]
+        pos_x = real_pos[:, 0:1]
+        pos_y = real_pos[:, 1:2]
+        disx_norm = (pos_x - stop_x) / self.queue_distance_norm
+        disy_norm = (pos_y - stop_y) / self.queue_distance_norm
+        dis = torch.sqrt(disx_norm ** 2 + disy_norm ** 2)
+        # speed from last predicted offset
+        speed_norm = (
+            torch.norm(last_pred_offset, dim=1, keepdim=True)
+            / self.queue_speed_norm
+        ).clamp(min=0.0, max=2.0)
+        return torch.cat(
+            (phase_one_hot, elapsed, remaining, phase_change, dis, disx_norm, disy_norm, speed_norm),
+            dim=1,
+        )
+
     def get_decode_step_context(
         self,
         step_index,
@@ -1770,7 +2110,8 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         Phase 2 #6 修复：``prev_phase`` 显式从上一帧传入，
         让 ``phase_change`` 在预测期能反映真实的相位切换。
         对于 step 0，使用 obs_state 最后一帧作为 prev；对于 step > 0，
-        使用 pred_state 上一步作为 prev。"""
+        使用 pred_state 上一步作为 prev。
+        """
         if step_index == 0:
             light_state = self.get_last_state(obs_traj_pos, obs_state)
             # 观测期最后一帧的相位作为 step 0 的 prev_phase。
@@ -2138,6 +2479,23 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
             ),
             dim=1,
         )
+        # DE-3: 最简可行 CycleState — 把观测期最后时刻的 ``[queue_last,
+        # cycle_last]`` 直接拼到 ``encoded_before_noise_hidden`` 后面 (与
+        # ``light_state_embedding`` 同级), 而不是用加性残差注入。这样 state
+        # 分支对 decoder 的耦合就不再依赖 ``state_residual_scale`` 与
+        # ``state_gate`` 的训练稳定性, 也不会被后续 12 步自回归 LSTM
+        # 更新洗掉。``minimal_viable_mode`` 下 ``disable_state_gating=True``
+        # 所以 ``gated_queue_last == queue_last`` / ``gated_cycle_last ==
+        # cycle_last``, 用 ``gated_*`` 与原逻辑保持一致。
+        if self.minimal_viable_mode:
+            encoded_before_noise_hidden = torch.cat(
+                (
+                    encoded_before_noise_hidden,
+                    gated_queue_last,
+                    gated_cycle_last,
+                ),
+                dim=1,
+            )
         self.debug_last_aux["queue_hidden_last"] = gated_queue_last
         self.debug_last_aux["cycle_hidden_last"] = gated_cycle_last
         # Phase 0 #4 修复：queue/cycle aux 头拆分为 reg/cls 子头，
@@ -2192,6 +2550,34 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         rollout_lane_queue_anchor = lane_queue_anchor_seq[-1]
         rollout_lane_ids = traffic_context["agent"]["lane_ids"][-1]
         if self.training:
+            # DE-1: oracle 直注需要当前解码位置的绝对坐标来算 distance /
+            # direction to stop line;``start_pos`` 是观测期最后一帧的
+            # 车辆位置,``current_real_pos`` 累加模型的"自身输出"(不是
+            # teacher-forced 真实位移),这样 oracle 特征始终反映模型
+            # 自己的轨迹在场景中的位置,而不是被教师信号"作弊"。
+            start_pos = obs_traj_pos[-1, :, 2:4]
+            current_real_pos = start_pos
+            # AR-1: state context = [gated_queue_last, gated_cycle_last] (48
+            # 维, AR-1 模式下 disable_state_gating=True, 所以两者分别
+            # 等于 queue_last / cycle_last)。这是 DE-3 拼到 init 的同一
+            # 截; AR-1 把它同时拼到每步 pred_lstm_model 输入 +
+            # pred_hidden2pos 输出投影。计算一次, 后面 12 步循环复用。
+            ar1_state_context = None
+            if self.ar1_direct_inject_mode:
+                ar1_state_context = torch.cat(
+                    (gated_queue_last, gated_cycle_last), dim=1
+                )
+            # AR-2: state context 同样 = [gated_queue_last, gated_cycle_last]
+            # (48 维), 含义与 AR-1 相同; 区别在于 AR-2 用它"乘法调制"
+            # pred_lstm_hidden (sigmoid gate), 而 AR-1 用它"加性拼接"
+            # 到 LSTM input / 输出投影。计算一次, 后面 12 步循环复用
+            # (gate 在每步根据当前 pred_lstm_hidden 与 state context
+            # 重新计算, 但 state context 本身是观测期最后时刻的常量)。
+            ar2_state_context = None
+            if self.ar2_multiplicative_gating_mode:
+                ar2_state_context = torch.cat(
+                    (gated_queue_last, gated_cycle_last), dim=1
+                )
             for i, input_t in enumerate(
                 obs_traj_rel[-self.pred_len :].chunk(self.pred_len, dim=0)
             ):
@@ -2202,9 +2588,48 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
 
                 teacher_force = torch.rand(1, device=pred_lstm_hidden.device).item() < teacher_forcing_ratio
                 input_t = input_t if teacher_force else output.unsqueeze(0)
+                # DE-1: oracle 直注 — 把 oracle 特征拼到 offset 后面,作为
+                # ``pred_lstm_model`` 的输入。oracle 特征**不**经过任何学习,
+                # 直接由 ``pred_state`` / 当前解码位置 / 上一步速度算出。
+                if self.oracle_inject_mode:
+                    oracle_step = self.build_oracle_step_feature(
+                        i,
+                        current_real_pos,
+                        last_rollout_offset,
+                        obs_state,
+                        pred_state,
+                    )
+                    lstm_input = torch.cat(
+                        (input_t.squeeze(0), oracle_step), dim=1
+                    )
+                elif self.ar1_direct_inject_mode:
+                    # AR-1: 把 [gated_queue_last, gated_cycle_last] (48 维)
+                    # 拼到 offset 后面作为 ``pred_lstm_model`` 的每步输入。
+                    # 与 DE-1 的核心差异: AR-1 用学到的 32D+16D hidden
+                    # 而不是 oracle 10 维物理特征, 拼接语义是 "learned
+                    # state context per step"。
+                    lstm_input = torch.cat(
+                        (input_t.squeeze(0), ar1_state_context), dim=1
+                    )
+                else:
+                    lstm_input = input_t.squeeze(0)
                 pred_lstm_hidden, pred_lstm_c_t = self.pred_lstm_model(
-                    input_t.squeeze(0), (pred_lstm_hidden, pred_lstm_c_t)
+                    lstm_input, (pred_lstm_hidden, pred_lstm_c_t)
                 )
+                # AR-2: 乘法门控 — 在 ``pred_lstm_model`` 更新后,根据当前
+                # ``pred_lstm_hidden`` 与 state context 计算 sigmoid 门控,
+                # 然后逐元素乘到 ``pred_lstm_hidden`` 上。这是 AR-2 与 AR-1
+                # 的核心差异: AR-1 把 state context "加性"地拼到 LSTM
+                # input (变成输入的一部分), AR-2 把 state context 通过
+                # sigmoid gate "调制" pred_lstm_hidden (变成状态门控)。
+                # 注意: AR-2 与 AR-1 互斥, AR-1 优先 (但实际上 model
+                # __init__ 已经校验互斥, 这里两个分支不会同时进入)。
+                if self.ar2_multiplicative_gating_mode:
+                    ar2_gate_input = torch.cat(
+                        (pred_lstm_hidden, ar2_state_context), dim=1
+                    )
+                    ar2_gate = self.ar2_hidden_gate(ar2_gate_input)
+                    pred_lstm_hidden = pred_lstm_hidden * ar2_gate
                 (
                     light_state_embedding,
                     current_cycle_feature,
@@ -2296,6 +2721,13 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                     pred_lstm_hidden = pred_lstm_hidden + step_state_residual
                     decoder_state_residual_seq.append(step_state_residual)
                 pred_input = torch.cat((light_state_embedding, pred_lstm_hidden), dim=1)
+                # AR-1: 把 [gated_queue_last, gated_cycle_last] (48 维)
+                # 同时拼到 ``pred_hidden2pos`` 的输入 — 让 state context
+                # 强行进入输出投影, 直接参与最终 (dx, dy) 的预测。
+                if self.ar1_direct_inject_mode:
+                    pred_input = torch.cat(
+                        (pred_input, ar1_state_context), dim=1
+                    )
                 output = self.pred_hidden2pos(pred_input)
                 # #3 P0 fix: train/eval rollout offset consistency.
                 # The eval branch (below) always seeds ``last_rollout_offset``
@@ -2306,17 +2738,73 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                 # model's own (errored) prediction 100% of the time during
                 # inference — a classic exposure-bias / train-eval shift.
                 last_rollout_offset = output
+                # DE-1: oracle 直注下,``current_real_pos`` 必须用模型的
+                # 自身输出更新,而不是用 teacher-forced 的真实位移 — 这样
+                # 训练和推理时 oracle 特征对位置的依赖口径一致,否则
+                # ``current_real_pos`` 在训练时会被 GT 拉偏,推理时却按
+                # 模型输出走,出现 train/eval shift。
+                if self.oracle_inject_mode:
+                    current_real_pos = current_real_pos + output
                 pred_traj_rel += [output]
         else:
+            # DE-1: oracle 直注需要当前解码位置。eval 分支没有
+            # teacher forcing,所以 ``current_real_pos`` 直接由 ``output``
+            # 累加更新即可。
+            start_pos = obs_traj_pos[-1, :, 2:4]
+            current_real_pos = start_pos
+            # AR-1: 与 train 分支一致, 计算一次 state context (48 维) 然后
+            # 在 12 步循环里复用。
+            ar1_state_context = None
+            if self.ar1_direct_inject_mode:
+                ar1_state_context = torch.cat(
+                    (gated_queue_last, gated_cycle_last), dim=1
+                )
+            # AR-2: 与 train 分支一致, 计算一次 state context (48 维) 然后
+            # 在 12 步循环里复用 — 每步 gate 根据当前 pred_lstm_hidden
+            # 与 state context 重新计算, 但 state context 本身是常量。
+            ar2_state_context = None
+            if self.ar2_multiplicative_gating_mode:
+                ar2_state_context = torch.cat(
+                    (gated_queue_last, gated_cycle_last), dim=1
+                )
             for i in range(self.pred_len):
                 # Phase 1 #18 fix: per-step noise injection during decoding.
                 pred_lstm_hidden = self.inject_per_step_decoder_noise(
                     pred_lstm_hidden, seq_start_end
                 )
 
+                # DE-1: oracle 直注 — 把 oracle 特征拼到 ``output`` 后面,
+                # 作为 ``pred_lstm_model`` 的输入。oracle 特征**不**经过
+                # 任何学习,直接由 ``pred_state`` / 当前解码位置 / 上一步
+                # 速度算出。
+                if self.oracle_inject_mode:
+                    oracle_step = self.build_oracle_step_feature(
+                        i,
+                        current_real_pos,
+                        output,
+                        obs_state,
+                        pred_state,
+                    )
+                    lstm_input = torch.cat((output, oracle_step), dim=1)
+                elif self.ar1_direct_inject_mode:
+                    # AR-1: 把 [gated_queue_last, gated_cycle_last] (48 维)
+                    # 拼到 ``output`` 后面, 作为 ``pred_lstm_model`` 的每步
+                    # 输入。AR-1 用学到的 32D+16D hidden 而非 oracle 10 维
+                    # 物理特征 — 与 DE-1 区别在此。
+                    lstm_input = torch.cat((output, ar1_state_context), dim=1)
+                else:
+                    lstm_input = output
                 pred_lstm_hidden, pred_lstm_c_t = self.pred_lstm_model(
-                    output, (pred_lstm_hidden, pred_lstm_c_t)
+                    lstm_input, (pred_lstm_hidden, pred_lstm_c_t)
                 )
+                # AR-2: 乘法门控 — 与 train 分支一致, 在 ``pred_lstm_model``
+                # 更新后用 sigmoid gate 调制 ``pred_lstm_hidden``。
+                if self.ar2_multiplicative_gating_mode:
+                    ar2_gate_input = torch.cat(
+                        (pred_lstm_hidden, ar2_state_context), dim=1
+                    )
+                    ar2_gate = self.ar2_hidden_gate(ar2_gate_input)
+                    pred_lstm_hidden = pred_lstm_hidden * ar2_gate
                 (
                     light_state_embedding,
                     current_cycle_feature,
@@ -2391,8 +2879,19 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
                     pred_lstm_hidden = pred_lstm_hidden + step_state_residual
                     decoder_state_residual_seq.append(step_state_residual)
                 pred_input = torch.cat((light_state_embedding, pred_lstm_hidden), dim=1)
+                # AR-1: 把 state context (48 维) 同时拼到
+                # ``pred_hidden2pos`` 的输入 — 让 state context 强行进入
+                # 输出投影, 直接参与最终 (dx, dy) 的预测。
+                if self.ar1_direct_inject_mode:
+                    pred_input = torch.cat(
+                        (pred_input, ar1_state_context), dim=1
+                    )
                 output = self.pred_hidden2pos(pred_input)
                 last_rollout_offset = output
+                # DE-1: oracle 直注下,``current_real_pos`` 在 eval 时
+                # 由 ``output`` 累加更新,与训练分支保持一致。
+                if self.oracle_inject_mode:
+                    current_real_pos = current_real_pos + output
                 pred_traj_rel += [output]
 
         if queue_rollout_hidden_seq:
