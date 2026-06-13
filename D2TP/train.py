@@ -260,6 +260,17 @@ parser.add_argument(
     "时生效。",
 )
 parser.add_argument(
+    "--c2_1_trajectory_level_mode",
+    action="store_true",
+    help="C2-1 第一变体 (``C2-1-MV1``) 开关: 把 trajectory encoder 由单层 "
+    "``nn.LSTMCell`` 升级为 2 层 stacked LSTMCell,保持 hidden_size 不变以"
+    "隔离'深度 vs 宽度'两个变量。这是 PLAN.md §6.3 分支 C2-1 的第一个决定"
+    "性实验 — 'trajectory-level capacity' 是否是当前 1.6× 差距的瓶颈,"
+    "**完全离开 state injection 路线**。该开关与 DE-3 / DE-1 / AR-1 / AR-2 "
+    "等 state injection 模式正交,可单独启用,也可与 ``--minimal_viable_mode`` "
+    "组合验证 'C2-1 + state hidden init 拼接' 联合效果。",
+)
+parser.add_argument(
     "--grad_clip",
     default=None,
     type=float,
@@ -1594,6 +1605,12 @@ def main(args):
         graph_lstm_hidden_size=args.graph_lstm_hidden_size,
         noise_dim=args.noise_dim,
         noise_type=args.noise_type,
+        # C2-1 第一变体: 与 model_type 正交, 既能作用于 d2tpred (cleanest
+        # isolation test) 也能作用于 cyclestate (与 --minimal_viable_mode
+        # 组合验证 "C2-1 + state hidden init 拼接" 联合效果)。
+        c2_1_trajectory_level_mode=bool(
+            getattr(args, "c2_1_trajectory_level_mode", False)
+        ),
     )
     if args.model_type == "cyclestate":
         ablation_cfg = AblationConfig.from_args(args)

@@ -134,6 +134,16 @@ parser.add_argument(
     "加载 checkpoint 时会报 missing key 错误。",
 )
 parser.add_argument(
+    "--c2_1_trajectory_level_mode",
+    action="store_true",
+    help="C2-1 第一变体 (``C2-1-MV1``) 评估开关: 与 train.py 配套使用, "
+    "在 ``TrajectoryGenerator`` 的 trajectory encoder 上叠加第二层 "
+    "LSTMCell (即 2 层 stacked encoder)。评估侧必须与训练时一致, 否则 "
+    "``traj_lstm_layer2`` 模块不会被创建, 加载 checkpoint 时会报 missing "
+    "key 错误。该开关与 ``--model_type`` 正交, 既能作用于 d2tpred 也能"
+    "作用于 cyclestate。",
+)
+parser.add_argument(
     "--rollout_residual_scale",
     default=1.0,
     type=float,
@@ -270,6 +280,12 @@ def get_generator(checkpoint):
         graph_lstm_hidden_size=args.graph_lstm_hidden_size,
         noise_dim=args.noise_dim,
         noise_type=args.noise_type,
+        # C2-1 第一变体: 与 model_type 正交, 既能作用于 d2tpred (cleanest
+        # isolation test) 也能作用于 cyclestate (与 --minimal_viable_mode
+        # 组合验证 "C2-1 + state hidden init 拼接" 联合效果)。
+        c2_1_trajectory_level_mode=bool(
+            getattr(args, "c2_1_trajectory_level_mode", False)
+        ),
     )
     if args.model_type == "cyclestate":
         # Phase 4 #22/#31: ``to_model_kwargs()`` 会把 "disable_aux_losses"

@@ -673,6 +673,7 @@ class TrajectoryGenerator(nn.Module):
         light_input_size=5,
         embedding_size=64,
         light_embedding_size=32,
+        c2_1_trajectory_level_mode=False,
     ):
         super(TrajectoryGenerator, self).__init__()
         # 基础配置：
@@ -685,6 +686,14 @@ class TrajectoryGenerator(nn.Module):
         self.obs_len = obs_len
         self.pred_len = pred_len
         self.light_embedding_size = light_embedding_size
+        # C2-1 第一变体 (``C2-1-MV1``) 开关：把 trajectory encoder 由
+        # 单层 ``nn.LSTMCell`` 升级为 2 层 stacked LSTMCell（新增
+        # ``traj_lstm_layer2``，保持 hidden_size 不变以隔离"深度 vs
+        # 宽度"这两个变量）。这是 PLAN.md §6.3 分支 C2-1 的第一个
+        # 决定性实验 — "trajectory-level capacity" 是否是当前
+        # 1.6× 差距的瓶颈，**完全离开 state injection 路线**。
+        # 默认 ``False`` 保持与历史 checkpoint 的兼容性。
+        self.c2_1_trajectory_level_mode = bool(c2_1_trajectory_level_mode)
         self.gatencoder = GATEncoder(
             n_units=n_units, n_heads=n_heads, dropout=dropout, alpha=alpha
         )
@@ -705,6 +714,21 @@ class TrajectoryGenerator(nn.Module):
 
         # 轨迹编码分支：逐帧吃相对位移。
         self.traj_lstm_model = nn.LSTMCell(traj_lstm_input_size, traj_lstm_hidden_size)
+        # C2-1-MV1: 当 ``c2_1_trajectory_level_mode=True`` 时，叠加第二层
+        # LSTMCell 进一步提取时序特征。layer2 输入/输出维度都是
+        # ``traj_lstm_hidden_size``，保持与单层版本对外接口完全一致
+        # （``traj_lstm_hidden_states[-1]`` 仍可作为 decoder init 的
+        # 拼接分量），从而 ``pred_lstm_hidden_size`` / ``pred_lstm_model``
+        # 输入维度都**不**需要改。
+        if self.c2_1_trajectory_level_mode:
+            self.traj_lstm_layer2 = nn.LSTMCell(
+                traj_lstm_hidden_size, traj_lstm_hidden_size
+            )
+        else:
+            # 占位属性：让 ``state_dict()`` 在两种模式下都有一致的键结构，
+            # 避免 ``strict=False`` 的 load 警告。forward 中通过
+            # ``if self.c2_1_trajectory_level_mode:`` 判定是否实际调用。
+            self.traj_lstm_layer2 = None
         # ⚠️ 保留但未使用(Phase 5 #11):``graph_lstm_model`` 是早期版本
         # 中用于在 GAT 之上再做时序聚合的 LSTMCell。重构后图时序聚合
         # 改由 ``seqGATEncoder`` 完成,本模块在 forward 主路径中**没有**
@@ -932,6 +956,10 @@ class TrajectoryGenerator(nn.Module):
         # traj_lstm_h_t / traj_lstm_c_t:
         # 个体运动编码器在当前时刻的隐藏状态与记忆状态。
         traj_lstm_h_t, traj_lstm_c_t = self.init_hidden_traj_lstm(batch)
+        # C2-1-MV1: 第二层 LSTM 的隐状态初始化。仅在
+        # ``c2_1_trajectory_level_mode=True`` 时实际被使用。
+        if self.c2_1_trajectory_level_mode:
+            traj_lstm_h2_t, traj_lstm_c2_t = self.init_hidden_traj_lstm(batch)
         # pred_traj_rel: 按时间顺序缓存每一步解码出的未来相对位移。
         pred_traj_rel = []
         # traj_lstm_hidden_states: 保存每个观测时刻的个体运动编码。
@@ -946,7 +974,18 @@ class TrajectoryGenerator(nn.Module):
             inputtraj = input_t[:, :, 2:4]
             traj_lstm_h_t, traj_lstm_c_t = self.traj_lstm_model(
                 inputtraj.squeeze(0), (traj_lstm_h_t, traj_lstm_c_t))
-            traj_lstm_hidden_states += [traj_lstm_h_t]
+            if self.c2_1_trajectory_level_mode:
+                # C2-1-MV1: 第 2 层 LSTM 接收 layer1 的 hidden 作为输入。
+                # 保持层间残差以外的"显式"耦合，避免与 state injection
+                # 路线混淆（C2-1 **不**引入 state 分支）。
+                traj_lstm_h2_t, traj_lstm_c2_t = self.traj_lstm_layer2(
+                    traj_lstm_h_t, (traj_lstm_h2_t, traj_lstm_c2_t)
+                )
+                # 存 layer2 的 hidden（与单层版本语义对齐：最后一帧
+                # 的"最深"轨迹编码作为 decoder init 的拼接分量）。
+                traj_lstm_hidden_states += [traj_lstm_h2_t]
+            else:
+                traj_lstm_hidden_states += [traj_lstm_h_t]
 
         # 2) 用 GAT 建模车辆之间的空间交互。
         kl = 6
@@ -1097,6 +1136,7 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         oracle_inject_mode=False,
         ar1_direct_inject_mode=False,
         ar2_multiplicative_gating_mode=False,
+        c2_1_trajectory_level_mode=False,
     ):
         # DE-1 决定性实验: ``oracle_inject_mode`` 把"oracle 交通状态直注"
         # 行为封装到一个独立 protocol-check 开关下。当启用时:
@@ -1255,6 +1295,12 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         # ``graph_lstm_hidden_size`` / ``noise_dim`` 来自父类,
         # ``queue_lstm_hidden_size`` / ``cycle_lstm_hidden_size`` 在父类之后
         # 才会被赋值。
+        # C2-1 第一变体 (``C2-1-MV1``): 完全独立的"trajectory capacity"
+        # 改动, 与所有 state injection 模式 (DE-3 / DE-1 / AR-1 / AR-2)
+        # 正交 — 只在父类的 trajectory encoder 上叠加第二层 LSTMCell, **不**
+        # 改 state 分支、decoder、light embedding、loss。父类中
+        # ``self.c2_1_trajectory_level_mode`` 在 ``super().__init__()`` 里
+        # 处理。
         self.disable_aux_losses = disable_aux_losses
         super(CycleStateTrajectoryGenerator, self).__init__(
             obs_len=obs_len,
@@ -1272,6 +1318,7 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
             light_input_size=light_input_size,
             embedding_size=embedding_size,
             light_embedding_size=light_embedding_size,
+            c2_1_trajectory_level_mode=c2_1_trajectory_level_mode,
         )
         if self.minimal_viable_mode:
             base_pred_hidden = (
@@ -2382,6 +2429,11 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
         queue_lstm_h_t, queue_lstm_c_t = self.init_hidden_queue_lstm(batch)
         cycle_lstm_h_t, cycle_lstm_c_t = self.init_hidden_cycle_lstm(batch)
 
+        # C2-1-MV1: 第二层 LSTM 的隐状态初始化。仅在
+        # ``c2_1_trajectory_level_mode=True`` 时实际被使用。
+        if self.c2_1_trajectory_level_mode:
+            traj_lstm_h2_t, traj_lstm_c2_t = self.init_hidden_traj_lstm(batch)
+
         pred_traj_rel = []
         traj_lstm_hidden_states = []
         graph_lstm_hidden_states = []
@@ -2423,7 +2475,17 @@ class CycleStateTrajectoryGenerator(TrajectoryGenerator):
             traj_lstm_h_t, traj_lstm_c_t = self.traj_lstm_model(
                 inputtraj.squeeze(0), (traj_lstm_h_t, traj_lstm_c_t)
             )
-            traj_lstm_hidden_states += [traj_lstm_h_t]
+            if self.c2_1_trajectory_level_mode:
+                # C2-1-MV1: 第 2 层 LSTM 接收 layer1 的 hidden 作为输入。
+                # 子类 forward 也有自己的 encoder 循环, 必须**显式**在这里
+                # 调 layer2 才能让梯度真正流到 traj_lstm_layer2, 否则
+                # layer2 在子类中永远不被使用, backward 时也不会收到梯度。
+                traj_lstm_h2_t, traj_lstm_c2_t = self.traj_lstm_layer2(
+                    traj_lstm_h_t, (traj_lstm_h2_t, traj_lstm_c2_t)
+                )
+                traj_lstm_hidden_states += [traj_lstm_h2_t]
+            else:
+                traj_lstm_hidden_states += [traj_lstm_h_t]
 
         obs_dire = obs_traj_pos[:, :, 0:6]
         obs_dire[:, :, 5] = obs_traj_pos[:, :, 9]
