@@ -17,6 +17,12 @@ import torch
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 MODULE_ROOT = REPO_ROOT / "D2TP"
+# 把仓库根加到 sys.path 才能让 ``from D2TP.data.loader import seed_worker``
+# 这类绝对 import 工作 (D2TP 必须作为 regular package 存在, 因此需要
+# ``D2TP/__init__.py`` + 仓库根在 sys.path 上, 仅 ``D2TP/`` 在 sys.path
+# 不够 — Python 不会把同名目录当作可导入的包)。
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if str(MODULE_ROOT) not in sys.path:
     sys.path.insert(0, str(MODULE_ROOT))
 
